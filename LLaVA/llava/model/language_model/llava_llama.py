@@ -20,13 +20,8 @@ import torch.nn as nn
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaForCausalLM
-from eagle.model.utils import temp_cache
 
-if temp_cache.eval_model == "llava_msd":
-    from eagle.model.modeling_llama_kv import LlamaModel, LlamaForCausalLM
-else:
-    from transformers import LlamaModel, LlamaForCausalLM
-
+from eagle.model.modeling_llama_kv import LlamaModel, LlamaForCausalLM
 
 import torch.nn.functional as F
 

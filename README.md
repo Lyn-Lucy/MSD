@@ -2,6 +2,16 @@
 
 📄 [**Paper on arXiv**](https://arxiv.org/pdf/2505.14260)
 *Speculative Decoding Reimagined for Multimodal Large Language Models*
+---
+
+## 🧠 MSD Models
+
+You can directly use the Multimodal Speculative Decoding (MSD) models available on Hugging Face:
+
+- **MSD-LLaVA1.5-7B**: [lucylyn/MSD-LLaVA1.5-7B](https://huggingface.co/lucylyn/MSD-LLaVA1.5-7B)
+- **MSD-LLaVA1.5-13B**: [lucylyn/MSD-LLaVA1.5-13B](https://huggingface.co/lucylyn/MSD-LLaVA1.5-13B)
+- **MSD-Qwen2VL-7B-Instruct**: [lucylyn/MSD-Qwen2VL-7B-Instruct](https://huggingface.co/lucylyn/MSD-Qwen2VL-7B-Instruct)
+
 
 ---
 
@@ -111,6 +121,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=2
     --msd_model_path <msd_model_path> \
     --tasks chartqa \
     --batch_size 1 \
+    --gen_kwargs temperature=0 \
     --use_msd \
 ```
 

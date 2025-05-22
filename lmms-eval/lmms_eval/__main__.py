@@ -286,11 +286,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         print(args)
         from eagle.model.utils import temp_cache
         temp_cache.reset()
-        temp_cache.eval_model = args.model
-
-        if hasattr(args, 'msd_model_path') and args.msd_model_path:
-            if "msd" in args.msd_model_path:
-                temp_cache.use_msd = True
+        temp_cache.use_msd = args.use_msd
 
 
     # Check if no arguments were passed after parsing

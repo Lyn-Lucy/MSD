@@ -103,7 +103,7 @@ def main():
         "datapath_v": f"{args.tmpdir_v}",
         "datapath_t": f"{args.tmpdir_t}",
         "is_warmup": True,
-        "num_epochs": 4,
+        "num_epochs": 20 * 2,
         "num_warmup_steps": 2000,
         "total_steps": 800000,
         "p_w": 0.1,
@@ -407,7 +407,6 @@ def main():
         epoch_loss = 0
         num_batches = 0
         model.train()
-        print(train_loader.dataset.current_ratio)
         for batch_idx, data in enumerate(tqdm(train_loader)):
 
             model.zero_grad()
@@ -475,7 +474,7 @@ def main():
         # if epoch % 10 == 0:
         #     deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.cpdir}/state_{epoch}")
         if debug == False:
-            name = "llava_v15_7b"
+            name = "llava_v15_7b_msd"
             model_engine.save_16bit_model(f"{args.cpdir}/{name}_{epoch}")
             torch.distributed.barrier()
             config = train_config["config_path"]
