@@ -1,0 +1,5 @@
+git+https://github.com/huggingface/evaluate@{COMMIT_PLACEHOLDER}
+git+https://github.com/google-research/rl-reliability-metrics
+scipy
+tensorflow
+gin-config
