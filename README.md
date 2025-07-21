@@ -71,7 +71,7 @@ After downloading, organize the data under `./image_data` in the following struc
 
 ## ⚙️ 3. Data Processing
 
-Use the following script to generate training data. You can control the target model by setting the `--model_type` argument (e.g., `llava_v15` or `qwen2_vl`):
+Use the following script to generate training data. You can control the target model by setting the `--model_type` argument (e.g., `llava_v15_t/v` or `qwen2_vl_t/v`):
 
 ```bash
 cd EAGLE/eagle/ge_data
