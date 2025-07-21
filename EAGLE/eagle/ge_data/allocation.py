@@ -21,8 +21,10 @@ gpus = [[0]]
 # gpus = [[0], [1], [2], [3]]
 num_p = len(gpus)
 
-if args.model_type == 'llava_v15':
-    outdir = '{}/llava_v15_{}_{}'.format(args.outdir,s,e)
+if args.model_type == 'llava_v15_v':
+    outdir = '{}/llava_v15_v_{}_{}'.format(args.outdir,s,e)
+elif args.model_type == 'llava_v15_t':
+    outdir = '{}/llava_v15_t_{}_{}'.format(args.outdir,s,e)
 elif args.model_type == 'qwen2_vl':
     outdir = '{}/qwen2vl_{}_{}'.format(args.outdir,s,e)
 
@@ -66,7 +68,7 @@ for i in range(num_p):
     gpu_index_str = ' '.join(map(str, gpu_index))
     # gpu_index_str='['+gpu_index_str+']'
 
-    if args.model_type == 'llava_v15':
+    if args.model_type == 'llava_v15_t' or args.model_type == 'llava_v15_v':
         command = "python ge_data_all_llava15.py --start={} --end={} --index={} --gpu_index {} --outdir {} --model {} --image_data_path {} --json_data_path {}".format(start, end, index,gpu_index_str, outdir, args.model, args.image_data_path, args.json_data_path)
     elif args.model_type == 'qwen2_vl':
         command = "python ge_data_all_qwen2vl.py --start={} --end={} --index={} --gpu_index {} --outdir {} --model {} --image_data_path {} --json_data_path {}".format(start, end, index,gpu_index_str, outdir, args.model, args.image_data_path, args.json_data_path)

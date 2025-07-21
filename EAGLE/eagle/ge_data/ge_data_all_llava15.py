@@ -131,7 +131,7 @@ def build_dataset_rank(
 
             image_tensor = None
             image_size = None
-            if examples["image"][i] != None:
+            if "image" in examples and examples["image"][i] is not None:
                 image_path = os.path.join(image_data_path, examples["image"][i])
                 image = load_image(image_path)
                 image_size = image.size
