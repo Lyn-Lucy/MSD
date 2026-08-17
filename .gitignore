@@ -1,0 +1,17 @@
+egg-info/
+egg-info/*
+__pycache__/
+*.pyc
+*.pyo
+wandb/
+eagle_llm.egg-info/
+trainout/
+datas/
+logs/
+llava_pretrain_regen/
+.venv-msd-eval/
+logs_*/
+
+# Local training checkpoints
+/ckpt/
+/ckpt_*/
