@@ -19,18 +19,13 @@ from typing import Union
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs
-from loguru import logger as eval_logger
-
 from lmms_eval import evaluator, utils
 from lmms_eval.api.registry import ALL_TASKS
 from lmms_eval.evaluator import request_caching_arg_to_dict
 from lmms_eval.loggers import EvaluationTracker, WandbLogger
 from lmms_eval.tasks import TaskManager
-from lmms_eval.utils import (
-    handle_non_serializable,
-    make_table,
-    simple_parse_args_string,
-)
+from lmms_eval.utils import handle_non_serializable, make_table, simple_parse_args_string
+from loguru import logger as eval_logger
 
 
 def _int_or_none_list_arg_type(min_len: int, max_len: int, defaults: str, value: str, split_char: str = ","):
@@ -110,6 +105,30 @@ def parse_eval_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="If True, use msd for inference",
+    )
+    parser.add_argument(
+        "--disable_decouple",
+        action="store_true",
+        default=False,
+        help="Disable feature decoupling for a baseline draft model trained with --no-decouple.",
+    )
+    parser.add_argument(
+        "--visual_tokens",
+        type=int,
+        default=32,
+        help="Number of visual tokens retained by KMeans (enabled by default for MSD).",
+    )
+    parser.add_argument(
+        "--pad_visual_span",
+        action="store_true",
+        default=False,
+        help="Pad compressed visual tokens back to their original span for a padding-trained draft model.",
+    )
+    parser.add_argument(
+        "--use_base",
+        type=int,
+        default=0,
+        help="If True, use base for inference",
     )
     parser.add_argument(
         "--batch_size",
@@ -285,9 +304,20 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         args = parse_eval_args()
         print(args)
         from eagle.model.utils import temp_cache
+
         temp_cache.reset()
         temp_cache.use_msd = args.use_msd
-
+        temp_cache.decouple = not args.disable_decouple
+        if args.visual_tokens <= 0:
+            raise ValueError("--visual_tokens must be positive")
+        if args.pad_visual_span and not args.use_msd:
+            raise ValueError("--pad_visual_span requires --use_msd")
+        temp_cache.visual_tokens = args.visual_tokens
+        temp_cache.pad_visual_span = args.pad_visual_span
+        print("args.use_base", args.use_base)
+        if args.use_base:
+            temp_cache.use_msd = False
+            print(temp_cache.use_msd)
 
     # Check if no arguments were passed after parsing
     if len(sys.argv) == 1:
@@ -310,7 +340,7 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
     eval_logger.add(sys.stdout, colorize=True, level=args.verbosity)
     eval_logger.info(f"Verbosity set to {args.verbosity}")
 
-    if hasattr(args, 'use_msd'):
+    if hasattr(args, "use_msd"):
         if args.use_msd:
             eval_logger.success("You are using MSD generation")
         else:

@@ -9,6 +9,11 @@ from safetensors import safe_open  # 导入 safetensors 库
 
 from eagle.model.cnets import Model
 from eagle.model.configs import EConfig, Qwen2VLConfig
+from eagle.model.visual_compression import (
+    build_shifted_visual_padding_mask,
+    compress_visual_sequence,
+    validate_visual_compression,
+)
 from typing import Any, Dict, List
 
 from torch import nn, optim
@@ -124,15 +129,42 @@ def main():
     parser = argparse.ArgumentParser(description='sp')
     parser.add_argument('--basepath', type=str, default=None)
     parser.add_argument('--tmpdir_v', type=str,
-                        default='/home/llx/spd/eagle_data', help="visual instruction-tuning dataset")
+                        required=True, help="visual instruction-tuning dataset")
     parser.add_argument('--tmpdir_t', type=str,
-                        default='/home/llx/spd/eagle_data', help="text_only instruction-tuning dataset")
+                        required=True, help="text_only instruction-tuning dataset")
     parser.add_argument('--config', type=str, default='llava_v15_7B_config.json')
     parser.add_argument('--cpdir', type=str, default="", help="The path to save the model")
+    parser.add_argument('--visual_tokens', type=int, default=32)
+    parser.add_argument('--decouple', action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable feature decoupling; use --no-decouple for the baseline")
+    parser.add_argument('--num_epochs', type=int, default=30)
+    parser.add_argument('--text_epochs', type=int, default=10)
+    parser.add_argument('--transition_epochs', type=int, default=10)
+    parser.add_argument('--resume_model_path', type=str, default=None,
+                        help="Checkpoint directory or pytorch_model.bin used to initialize model weights")
+    parser.add_argument('--epoch_offset', type=int, default=0,
+                        help="Epoch number added to checkpoint names when continuing training")
+    parser.add_argument('--pad_visual_span', action='store_true',
+                        help="Pad compressed visual spans back to their original length")
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
     parser.add_argument("-debug", "--debug", action="store_true", help="debug mode")
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
+    validate_visual_compression(args.visual_tokens)
+    if args.num_epochs <= 0:
+        raise ValueError("--num_epochs must be positive")
+    if args.text_epochs < 0 or args.transition_epochs < 0:
+        raise ValueError("--text_epochs and --transition_epochs must be non-negative")
+    if args.text_epochs + args.transition_epochs > args.num_epochs:
+        raise ValueError("text and transition epochs cannot exceed --num_epochs")
+    if args.epoch_offset < 0:
+        raise ValueError("--epoch_offset must be non-negative")
+    compression_tag = f"kmeans{args.visual_tokens}"
+    if args.pad_visual_span:
+        compression_tag += "_padding"
+    if not args.decouple:
+        compression_tag += "_nodecouple"
+    model_name = f"llava_v16_7b_msd_{'decouple_' if args.decouple else ''}{compression_tag}"
 
 
     train_config = {
@@ -142,8 +174,16 @@ def main():
         # "datapath": f"{args.tmpdir}",
         "datapath_v": f"{args.tmpdir_v}",
         "datapath_t": f"{args.tmpdir_t}",
+        "visual_compression": "kmeans",
+        "visual_tokens": args.visual_tokens,
+        "decouple": args.decouple,
         "is_warmup": True,
-        "num_epochs": 30,
+        "num_epochs": args.num_epochs,
+        "text_epochs": args.text_epochs,
+        "transition_epochs": args.transition_epochs,
+        "pad_visual_span": args.pad_visual_span,
+        "resume_model_path": args.resume_model_path,
+        "epoch_offset": args.epoch_offset,
         "num_warmup_steps": 2000,
         "total_steps": 800000,
         "p_w": 0.1,
@@ -190,17 +230,21 @@ def main():
             custom_name = "debug"
         else:
             # custom_name = f"llava_v15_7b_ori_pool_{pool_kernel_size}"
-            custom_name = f"llava_v16_7b_msd_decouple_kmeans32"
+            custom_name = model_name
 
         # 4. 组合成一个唯一的 run ID
         run_id = f"{custom_name}"
 
         run = wandb.init(project="llava_eagle_13b", config=train_config, id=run_id)  # mode 可以切换 offline/online
 
+        from pathlib import Path
+
+        eagle_root = Path(__file__).resolve().parents[1]
         files_to_save = [
-            '/mnt/bn/bytenn-yg2/llx/MSD/EAGLE/eagle/train/main_deepspeed_llava16_decouple_kmeans_repro.py',
-            '/mnt/bn/bytenn-yg2/llx/MSD/EAGLE/eagle/model/cnets.py',
-            '/mnt/bn/bytenn-yg2/llx/MSD/EAGLE/eagle/train/ds_config_llava16_repro.json'
+            str(Path(__file__).resolve()),
+            str(eagle_root / "model" / "cnets.py"),
+            str(eagle_root / "model" / "visual_compression.py"),
+            str(eagle_root / "train" / "ds_config_llava16_repro.json"),
         ]
 
         for src in files_to_save:
@@ -242,10 +286,12 @@ def main():
 
 
     class CustomDataset(Dataset):
-        def __init__(self, datapath_v, datapath_t, total_epoch, transform=None):
+        def __init__(self, datapath_v, datapath_t, total_epoch, text_epochs, transition_epochs, transform=None):
             self.data_v = datapath_v
             self.data_t = datapath_t
             self.total_epoch = total_epoch
+            self.text_epochs = text_epochs
+            self.transition_epochs = transition_epochs
             self.transform = transform
 
             self.epoch_now = 1
@@ -253,12 +299,13 @@ def main():
             self.dataset_t_size = len(self.data_t)
 
             self.current_ratio = 0.0
+            self.update_ratio()
 
         def update_ratio(self):
-            if self.epoch_now <= 10:
+            if self.epoch_now <= self.text_epochs:
                 self.current_ratio = 0.0
-            elif self.epoch_now <= 20:
-                self.current_ratio = (self.epoch_now - 10) / 10
+            elif self.epoch_now <= self.text_epochs + self.transition_epochs:
+                self.current_ratio = (self.epoch_now - self.text_epochs) / self.transition_epochs
             else:
                 self.current_ratio = 1.0
 
@@ -272,7 +319,8 @@ def main():
             return min(len(self.data_v), len(self.data_t))
 
         def load_data(self, idx, dataset):
-            data = torch.load(dataset[idx])
+            data_path = dataset[idx]
+            data = torch.load(data_path)
             return data
 
         def __getitem__(self, index):
@@ -291,116 +339,32 @@ def main():
                 inputs_embeds = embedding(input_ids).to(torch.bfloat16)
 
             image_tokens_num = 0
+            visual_padding_bounds = None
 
             if 32000 in input_ids:
                 image_tokens_num = (input_ids == 32000).sum().item()
-            # ======== 视觉 Token 剪枝部分 ========
-            # ==============================batch-kmeans=========================
+            # Use the same visual compression primitive as inference.
             if (input_ids == 32000).any():
-                visual_mask = (input_ids == 32000)
-                text_mask = ~visual_mask
-
-                # 索引与形状
-                visual_indices = torch.nonzero(visual_mask.squeeze(), as_tuple=False).squeeze(1)  # [N_vis]
-                text_indices = torch.nonzero(text_mask.squeeze(), as_tuple=False).squeeze(1)
-                N_vis = visual_indices.numel()
-                H = hidden_state.shape[-1]
-
-                # N_vis <= 1 则无需处理
-                if N_vis > 1:
-                    # 取出视觉部分特征
-                    vis_inputs = inputs_embeds[:, visual_indices, :].squeeze(0).to(torch.float32)      # [N_vis, H]
-                    vis_hidden = hidden_state[:, visual_indices, :].squeeze(0).to(torch.float32)      # [N_vis, H]
-
-                    # ===============================
-                    # 🚀 Mini-batch 近似 KMeans 聚类压缩
-                    # ===============================
-                    K = min(32, N_vis)  # 你可以自由调整保留的视觉token数
-                    perm = torch.randperm(N_vis, device=vis_inputs.device)
-                    centers = vis_inputs[perm[:K]]  # [K, H] 随机初始化聚类中心
-
-                    dist = torch.cdist(vis_inputs, centers, p=2)   # [N_vis, K]
-                    assignments = dist.argmin(dim=-1)              # [N_vis]
-
-                    # scatter 向量化求均值聚合
-                    counts = torch.bincount(assignments, minlength=K).clamp(min=1).unsqueeze(1).to(vis_inputs.device)
-                    merged_sum_hidden = torch.zeros(K, H, device=vis_hidden.device)
-                    merged_sum_inputs = torch.zeros(K, H, device=vis_inputs.device)
-
-                    merged_sum_hidden = merged_sum_hidden.index_add(0, assignments, vis_hidden)
-                    merged_sum_inputs = merged_sum_inputs.index_add(0, assignments, vis_inputs)
-
-                    merged_hidden = merged_sum_hidden / counts  # [K, H]
-                    merged_inputs = merged_sum_inputs / counts  # [K, H]
-
-                    # ===============================
-                    # 构造视觉token id 与 loss_mask
-                    # ===============================
-                    vis_ids_multi = torch.full((1, K), 32000, dtype=input_ids.dtype, device=input_ids.device)
-                    vis_loss_val = loss_mask[:, visual_indices[:K]]  # [1, K]
-
-                    # 判断视觉token是否为连续块（通常是）
-                    vis_sorted = torch.sort(visual_indices).values
-                    is_contiguous = (vis_sorted[-1] - vis_sorted[0] + 1 == vis_sorted.numel()) and \
-                                    (torch.diff(vis_sorted).min() == 1)
-
-                    if is_contiguous:
-                        first_vis = vis_sorted[0].item()
-                        last_vis  = vis_sorted[-1].item()
-
-                        pre_text_idx  = text_indices[text_indices < first_vis]
-                        post_text_idx = text_indices[text_indices > last_vis]
-
-                        # 拼接：前文本 + 聚类视觉 + 后文本
-                        input_ids = torch.cat([
-                            input_ids[:, pre_text_idx],
-                            vis_ids_multi,
-                            input_ids[:, post_text_idx]
-                        ], dim=1)
-
-                        hidden_state = torch.cat([
-                            hidden_state[:, pre_text_idx, :],
-                            merged_hidden.unsqueeze(0).to(hidden_state.dtype),
-                            hidden_state[:, post_text_idx, :]
-                        ], dim=1)
-
-                        inputs_embeds = torch.cat([
-                            inputs_embeds[:, pre_text_idx, :],
-                            merged_inputs.unsqueeze(0).to(inputs_embeds.dtype),
-                            inputs_embeds[:, post_text_idx, :]
-                        ], dim=1)
-
-                        loss_mask = torch.cat([
-                            loss_mask[:, pre_text_idx],
-                            vis_loss_val,
-                            loss_mask[:, post_text_idx]
-                        ], dim=1)
-                    else:
-                        # 若非连续，安全兜底：文本保持原序，视觉token追加到末尾
-                        sorted_text_idx = torch.sort(text_indices).values
-
-                        input_ids = torch.cat([
-                            input_ids[:, sorted_text_idx],
-                            vis_ids_multi
-                        ], dim=1)
-
-                        hidden_state = torch.cat([
-                            hidden_state[:, sorted_text_idx, :],
-                            merged_hidden.unsqueeze(0).to(hidden_state.dtype)
-                        ], dim=1)
-
-                        inputs_embeds = torch.cat([
-                            inputs_embeds[:, sorted_text_idx, :],
-                            merged_inputs.unsqueeze(0).to(inputs_embeds.dtype)
-                        ], dim=1)
-
-                        loss_mask = torch.cat([
-                            loss_mask[:, sorted_text_idx],
-                            vis_loss_val
-                        ], dim=1)
-
-                # 更新视觉token数量统计
-                image_tokens_num = (input_ids == 32000).sum().item()
+                original_image_tokens_num = image_tokens_num
+                original_visual_start = int(torch.where(input_ids[0] == 32000)[0][0].item())
+                input_ids, inputs_embeds, hidden_state, loss_mask, _ = compress_visual_sequence(
+                    input_ids,
+                    inputs_embeds,
+                    hidden_state,
+                    image_token_id=32000,
+                    num_tokens=args.visual_tokens,
+                    loss_mask=loss_mask,
+                    pad_to_original=args.pad_visual_span,
+                )
+                kept_image_tokens_num = (input_ids == 32000).sum().item()
+                if args.pad_visual_span:
+                    image_tokens_num = original_image_tokens_num
+                    visual_padding_bounds = (
+                        original_visual_start + kept_image_tokens_num,
+                        original_visual_start + original_image_tokens_num,
+                    )
+                else:
+                    image_tokens_num = kept_image_tokens_num
                 if loss_mask[:, input_ids[0] == 32000].any():
                     raise ValueError("loss_mask must not select compressed visual tokens")
             # ==============================only text=========================
@@ -426,6 +390,14 @@ def main():
 
             length = hidden_state.shape[1]
             attention_mask = [1] * length
+            if visual_padding_bounds is not None:
+                original_visual_start = visual_padding_bounds[1] - image_tokens_num
+                attention_mask = build_shifted_visual_padding_mask(
+                    sequence_length=length,
+                    visual_start=original_visual_start,
+                    original_visual_tokens=image_tokens_num,
+                    kept_visual_tokens=visual_padding_bounds[0] - original_visual_start,
+                )[0].tolist()
             loss_mask = loss_mask[0].tolist()
             loss_mask[-1] = 0
 
@@ -566,8 +538,21 @@ def main():
 
         testdatapath_v = datapath_v[int(len(datapath_v) * 0.95):]
         testdatapath_t = datapath_t[int(len(datapath_t) * 0.95):]
-    traindataset = CustomDataset(traindatapath_v, traindatapath_t, total_epoch=train_config["num_epochs"], transform=aug)
-    testdataset = CustomDataset(testdatapath_v, testdatapath_t, total_epoch=train_config["num_epochs"])
+    traindataset = CustomDataset(
+        traindatapath_v,
+        traindatapath_t,
+        total_epoch=train_config["num_epochs"],
+        text_epochs=train_config["text_epochs"],
+        transition_epochs=train_config["transition_epochs"],
+        transform=aug,
+    )
+    testdataset = CustomDataset(
+        testdatapath_v,
+        testdatapath_t,
+        total_epoch=train_config["num_epochs"],
+        text_epochs=train_config["text_epochs"],
+        transition_epochs=train_config["transition_epochs"],
+    )
     # test_loader = DataLoader(testdataset, batch_size=train_config["bs"], shuffle=False,
     #                          collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"], pin_memory=True)
 
@@ -580,8 +565,26 @@ def main():
     else:
         config = EConfig.from_pretrained(train_config["config_path"])
 
-    model = Model(config, path=args.basepath, load_emb=False, init=False, train_embed=False, decouple=True)
+    model = Model(
+        config,
+        path=args.basepath,
+        load_emb=False,
+        init=False,
+        train_embed=False,
+        decouple=args.decouple,
+    )
     model.embed_tokens.weight.data.copy_(embed_tensor.to(model.embed_tokens.weight.dtype))
+    if args.resume_model_path:
+        resume_file = args.resume_model_path
+        if os.path.isdir(resume_file):
+            resume_file = os.path.join(resume_file, "pytorch_model.bin")
+        if not os.path.isfile(resume_file):
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_file}")
+        resume_state = torch.load(resume_file, map_location="cpu")
+        model.load_state_dict(resume_state, strict=True)
+        del resume_state
+        if rank == 0:
+            print(f"Loaded continuation weights from {resume_file}", flush=True)
     zeropadding_embed = model.embed_tokens(torch.tensor(0))[None, None, :].to(dtype=(torch.bfloat16 if use_bf16 else torch.float16)).detach()
 
     criterion = nn.SmoothL1Loss(reduction="none")
@@ -682,13 +685,14 @@ def main():
         # if epoch % 10 == 0:
         #     deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.cpdir}/state_{epoch}")
         if debug == False:
-            name = f"llava_v16_7b_msd_decouple_kmeans32"
-            model_engine.save_16bit_model(f"{args.cpdir}/{name}_{epoch}")
+            name = model_name
+            output_epoch = args.epoch_offset + epoch
+            model_engine.save_16bit_model(f"{args.cpdir}/{name}_{output_epoch}")
             torch.distributed.barrier()
             if rank == 0:
                 config = train_config["config_path"]
                 import shutil
-                target_file = f"{args.cpdir}/{name}_{epoch}/config.json"
+                target_file = f"{args.cpdir}/{name}_{output_epoch}/config.json"
                 shutil.copy(config, target_file)
         torch.distributed.barrier()
 

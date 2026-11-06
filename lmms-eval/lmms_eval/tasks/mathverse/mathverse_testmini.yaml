@@ -29,6 +29,7 @@ lmms_eval_specific_kwargs:
   default:
     shot_type: "format-prompt" # can also be "custom-prompt"
     query_type: "query_wo" # now only support query_wo
+    post_prompt: "\nFor the following question, provide a detailed explanation of your reasoning leading to the answer."
 model_specific_generation_kwargs:
   llava:
     image_aspect_ratio: original

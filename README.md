@@ -121,16 +121,62 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=2
     --msd_model_path <msd_model_path> \
     --tasks chartqa \
     --batch_size 1 \
-    --gen_kwargs temperature=0 \
-    --use_msd \
+    --gen_kwargs temperature=0,max_new_tokens=512 \
+    --limit 100 \
+    --use_msd
 ```
 
 **Parameters:**
 
-* `<model_name>`: short name identifier of your model, e.g., `llava_msd` or `qwen2_vl_msd`
+* `<model_name>`: short name identifier of your model, e.g., `llava_hf_msd` or `qwen2_vl_msd`
 * `<base_model_path>`: path to the base pretrained model
 * `<msd_model_path>`: path to the MSD model
 ---
+
+## Maintained training and evaluation entrypoints
+
+Use `llava_hf_msd` for Hugging Face LLaVA/LLaVA-NeXT models and
+`qwen2_vl_msd` for Qwen2.5-VL. MSD uses KMeans by default and retains 32
+visual tokens; change the count with `--visual_tokens`. Standard decoding
+is available by omitting `--use_msd`. Generation results retain the original
+prompt prefix. The evaluator reports request-loop time and average accepted
+length directly, without an auxiliary runner.
+
+The LLaVA adapter uses a total sequence limit of 4096. Generation respects
+task defaults and `--gen_kwargs`; specify `max_new_tokens=512` to reproduce
+the previous LLaVA timing configuration. Timing excludes model loading.
+Stop competing GPU workloads before measuring speed.
+
+For offline datasets saved with Hugging Face `save_to_disk`, optionally set
+`MSD_EVAL_DATA_ROOT` to a directory with task subdirectories:
+`chartqa`, `textvqa_val`, `vqav2`, `ai2d`, `scienceqa_img`,
+`hallusion_bench_image`, and `mmbench_en_test`. Otherwise datasets load
+through the normal Hugging Face path.
+
+Run evaluation with the direct `accelerate launch -m lmms_eval` command above.
+Select one or more benchmarks with `--tasks` (comma-separated), and set
+`--limit`, `--gen_kwargs`, and optional `--output_path` explicitly.
+
+`ds_train.sh` accepts `BASE_MODEL`, `VISUAL_DATA`, `TEXT_DATA`,
+`MODEL_CONFIG`, and optional `CKPT_DIR`, `GPU_INCLUDE`, and
+`DEEPSPEED_CONFIG`. For LLaVA-NeXT curriculum training, invoke the trainer
+directly:
+
+```bash
+torchrun --standalone --nproc_per_node=1 \
+    EAGLE/eagle/train/main_deepspeed_llava16_decouple_kmeans_repro.py \
+    --basepath <base_model_path> \
+    --tmpdir_v <visual_data_path> --tmpdir_t <text_data_path> \
+    --config EAGLE/eagle/train/llava_hf_v16_7B_config.json \
+    --deepspeed_config EAGLE/eagle/train/ds_config_llava16_repro.json \
+    --cpdir <checkpoint_output_dir>
+```
+
+Data generation uses `prepare_data_llava16.sh` or
+`prepare_data_qwen25vl.sh`, with `BASE_MODEL`, `IMAGE_DATA`, `JSON_DATA`,
+and `DATA_OUTPUT` set explicitly. Source code and configuration belong in
+Git; model weights, datasets, logs, local editor settings, and generated
+figures remain local.
 
 ## Affiliation
 

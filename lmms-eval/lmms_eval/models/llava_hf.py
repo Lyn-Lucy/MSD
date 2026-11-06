@@ -70,7 +70,7 @@ class LlavaHf(lmms):
         batch_size: int = 1,
         trust_remote_code: Optional[bool] = False,
         attn_implementation: Optional[str] = None,
-        device_map: str = "",
+        device_map: str = "auto",
         chat_template: Optional[str] = None,
         use_cache: bool = True,
         max_frames_num: Optional[int] = 32,
@@ -342,15 +342,15 @@ class LlavaHf(lmms):
                     res.append("")
                     eval_logger.info(f"Error {e} when loading video : {visuals}")
                     pbar.update(1)
-
+            breakpoint()
             if task_type == "image":
                 inputs = self._image_processor(images=visuals, text=text, return_tensors="pt").to(self._device, self.model.dtype)
             elif task_type == "video":
                 inputs = self._image_processor(videos=visuals, text=text, return_tensors="pt").to(self._device, self.model.dtype)
 
             gen_kwargs["image_sizes"] = [visuals[idx].size for idx in range(len(visuals))]
-            if "max_new_tokens" not in gen_kwargs:
-                gen_kwargs["max_new_tokens"] = 1024
+            # if "max_new_tokens" not in gen_kwargs:
+            gen_kwargs["max_new_tokens"] = 1024
             if "temperature" not in gen_kwargs:
                 gen_kwargs["temperature"] = 0
             if "top_p" not in gen_kwargs:
@@ -373,7 +373,9 @@ class LlavaHf(lmms):
             except Exception as e:
                 eval_logger.error(f"Error {e} in generating")
                 cont = ""
-            text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)[0]
+            text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
+            print("Generated text:", text_outputs)
+            print("Generation len:", len(text_outputs))
             if self.accelerator.is_main_process and doc_id[0] % 100 == 0:
                 eval_logger.debug(f"Generated text for doc ID {doc_id[0]}:\n\n{text_outputs}\n")
 

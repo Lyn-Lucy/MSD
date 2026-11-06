@@ -6,19 +6,16 @@ import decord
 import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
-from loguru import logger as eval_logger
-from PIL import Image
-from tqdm import tqdm
-from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
-
+from eagle.model.ea_model import EaModel
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
 from lmms_eval.models.model_utils.load_video import load_video_decord
-
-
-from eagle.model.ea_model import EaModel
+from loguru import logger as eval_logger
+from PIL import Image
+from tqdm import tqdm
+from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
 
 try:
     from qwen_vl_utils import process_vision_info
@@ -72,14 +69,7 @@ class Qwen2_VL_MSD(lmms):
         #     ).eval()
         # else:
         #     self._model = Qwen2VLForConditionalGeneration.from_pretrained(pretrained, torch_dtype="auto", device_map=self.device_map).eval()
-        self._model, _ = EaModel.from_pretrained(
-            base_model_path=pretrained,
-            ea_model_path=msd_model,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            device_map="auto",
-            total_token=-1
-        )
+        self._model, _ = EaModel.from_pretrained(base_model_path=pretrained, ea_model_path=msd_model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto", total_token=59)
         self.processor = AutoProcessor.from_pretrained(pretrained, max_pixels=max_pixels, min_pixels=min_pixels)
         self.max_pixels = max_pixels
         self.min_pixels = min_pixels
@@ -163,7 +153,7 @@ class Qwen2_VL_MSD(lmms):
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
-        
+
         def _collate(x):
             # the negative sign on len(toks) sorts descending - this has a few advantages:
             # - time estimates will always be over not underestimates, which is more useful for planning
@@ -173,6 +163,7 @@ class Qwen2_VL_MSD(lmms):
             # - any OOMs will happen right away rather than near the end
             toks = self.tokenizer.encode(x[0])
             return -len(toks), x[0]
+
         pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="Model Responding")
         # we group requests by their generation_kwargs,
         # so that we don't try to execute e.g. greedy sampling and temp=0.8 sampling
@@ -262,7 +253,7 @@ class Qwen2_VL_MSD(lmms):
                 inputs = inputs.to(self.device)
 
             if "max_new_tokens" not in gen_kwargs:
-                gen_kwargs["max_new_tokens"] = 128
+                gen_kwargs["max_new_tokens"] = 512
             if "temperature" not in gen_kwargs:
                 gen_kwargs["temperature"] = 0
             if "top_p" not in gen_kwargs:
@@ -270,9 +261,15 @@ class Qwen2_VL_MSD(lmms):
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
 
+            temperature = float(gen_kwargs["temperature"])
+            top_p = gen_kwargs["top_p"]
+            top_p = 0.0 if top_p is None or str(top_p).lower() == "none" else float(top_p)
+            max_new_tokens = int(gen_kwargs["max_new_tokens"])
+
             pad_token_id = self.tokenizer.pad_token_id
 
             from eagle.model.utils import get_input_embeds_qwen2vl
+
             input_embeds = get_input_embeds_qwen2vl(inputs.input_ids, inputs.pixel_values, inputs.image_grid_thw, self.model.base_model)
             # cont = self.model.generate(
             #     **inputs,
@@ -287,9 +284,21 @@ class Qwen2_VL_MSD(lmms):
             # )
 
             if self.use_msd:
-                output_ids = self.model.msdgenerate(inputs.input_ids, inputs_embeds=input_embeds, temperature=0, max_new_tokens=512)
+                output_ids, _, _, _ = self.model.msdgenerate(
+                    inputs.input_ids,
+                    inputs_embeds=input_embeds,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                )
             else:
-                output_ids = self.model.naivegenerate(inputs.input_ids, inputs_embeds=input_embeds, temperature=0, max_new_tokens=512)
+                output_ids = self.model.naivegenerate(
+                    inputs.input_ids,
+                    inputs_embeds=input_embeds,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_new_tokens=max_new_tokens,
+                )
 
             generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, output_ids)]
 

@@ -6,6 +6,11 @@ from typing import List, Tuple
 import time
 import torch
 
+from eagle.model.visual_compression import (
+    build_shifted_visual_padding_mask,
+    compress_visual_sequence,
+)
+
 # TODO
 # from transformers import LlamaTokenizer
 # tokenizer=LlamaTokenizer.from_pretrained("/home/lyh/weights/hf/vicuna_v13/7B/")
@@ -22,6 +27,12 @@ from transformers.generation.logits_process import (
 
 class temp_cache:
     use_msd = False
+    decouple = True
+    reduced_len = 0
+    visual_tokens = 32
+    pad_visual_span = False
+    visual_span_tokens = 0
+    draft_attention_mask = None
     sample_accept_token = []
     sample_reject_token = []
     answer_file = None
@@ -39,6 +50,12 @@ class temp_cache:
     @classmethod
     def reset(cls):
         cls.use_msd = False
+        cls.decouple = True
+        cls.reduced_len = 0
+        cls.visual_tokens = 32
+        cls.pad_visual_span = False
+        cls.visual_span_tokens = 0
+        cls.draft_attention_mask = None
         cls.sample_accept_token = []
         cls.sample_reject_token = []
         cls.total_time = 0
@@ -260,6 +277,42 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_
     outputs, orig, hidden_states = model(
         input_ids, past_key_values=past_key_values, output_orig=True, inputs_embeds=inputs_embeds
     )
+    temp_cache.reduced_len = 0
+    temp_cache.visual_span_tokens = 0
+    temp_cache.draft_attention_mask = None
+    IMAGE_TOKEN_IDS = [32000, 151655]
+    image_token_id = None
+    for tid in IMAGE_TOKEN_IDS:
+        if tid in input_ids:
+            image_token_id = tid
+            break
+
+    if image_token_id is not None:
+        original_visual_indices = torch.nonzero(
+            input_ids[0] == image_token_id, as_tuple=False
+        ).flatten()
+        original_visual_start = int(original_visual_indices[0].item())
+        original_visual_tokens = int(original_visual_indices.numel())
+        input_ids, inputs_embeds, hidden_states, _, temp_cache.reduced_len = compress_visual_sequence(
+            input_ids,
+            inputs_embeds,
+            hidden_states,
+            image_token_id=image_token_id,
+            num_tokens=temp_cache.visual_tokens,
+            pad_to_original=temp_cache.pad_visual_span,
+        )
+        if temp_cache.pad_visual_span:
+            kept_visual_tokens = int((input_ids == image_token_id).sum().item())
+            temp_cache.visual_span_tokens = original_visual_tokens
+            temp_cache.draft_attention_mask = build_shifted_visual_padding_mask(
+                sequence_length=input_ids.shape[1],
+                visual_start=original_visual_start,
+                original_visual_tokens=original_visual_tokens,
+                kept_visual_tokens=kept_visual_tokens,
+                device=input_ids.device,
+            )
+            # Physical padding restores the original length, so no RoPE/KV offset is needed.
+            temp_cache.reduced_len = 0
 
     if logits_processor is not None:
         logits = orig[:, -1]
@@ -274,7 +327,7 @@ def initialize_tree(input_ids, model, past_key_values, logits_processor, inputs_
     # Clone the output hidden states
 
     draft_tokens, retrieve_indices,tree_mask,tree_position_ids = model.ea_layer.topK_genrate(hidden_states, input_ids, model.base_model.lm_head,logits_processor, inputs_embeds)
-    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token
+    return draft_tokens, retrieve_indices,tree_mask,tree_position_ids, orig, hidden_states, token, input_ids[:,:-1]
 
 
 def reset_tree_mode(
@@ -337,11 +390,13 @@ def tree_decoding(
     position_ids = tree_position_ids + input_ids.shape[1]
 
     if position_ids is not None and position_ids.dim() == 1:
-            position_ids = position_ids.unsqueeze(0)
+        position_ids = position_ids.unsqueeze(0)
 
     if -200 in input_ids:
         position_ids += 575
     from eagle.model.utils import temp_cache
+    if temp_cache.reduced_len:
+        position_ids += temp_cache.reduced_len
 
     # tree_candidates = tree_candidates[:, :2]
     # position_ids = position_ids[:2]
@@ -459,6 +514,8 @@ def update_inference_inputs(
         sample_p
 ):
     prev_input_len = input_ids.shape[1]
+    if temp_cache.reduced_len:
+        prev_input_len += temp_cache.reduced_len
     if -200 in input_ids:
         prev_input_len += 575 
     # Map the best candidate indices to the original indices in the sequence
@@ -532,7 +589,7 @@ def get_input_embeds_qwen2vl(input_ids, pixel_values, image_grid_thw, model):
     with torch.no_grad():
         inputs_embeds = model.model.embed_tokens(input_ids)
         if pixel_values is not None:
-            pixel_values = pixel_values.type(model.visual.get_dtype())
+            pixel_values = pixel_values.type(model.visual.dtype)
             image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
             n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
             n_image_features = image_embeds.shape[0]
@@ -540,16 +597,17 @@ def get_input_embeds_qwen2vl(input_ids, pixel_values, image_grid_thw, model):
                 raise ValueError(
                     f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
                 )
-            image_mask = (
-                (input_ids == model.config.image_token_id)
-                .unsqueeze(-1)
-                .expand_as(inputs_embeds)
-                .to(inputs_embeds.device)
-            )
-            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
-    return inputs_embeds
+            mask = input_ids == model.config.image_token_id
+            mask_unsqueezed = mask.unsqueeze(-1)
+            mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
+            image_mask = mask_expanded.to(inputs_embeds.device)
+
+            image_embeds = image_embeds.to(
+                inputs_embeds.device, inputs_embeds.dtype
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+        return inputs_embeds
 
 
 

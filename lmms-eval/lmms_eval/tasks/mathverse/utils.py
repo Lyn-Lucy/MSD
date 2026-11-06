@@ -40,7 +40,8 @@ def mathverse_doc_to_text(doc, lmms_eval_specific_kwargs=None):
     query_prompt = mathverse_evaluator.create_one_query(
         problem, examples=None, shot_num=0, shot_type=lmms_eval_specific_kwargs["shot_type"], hint=lmms_eval_specific_kwargs.get("hint", None), query_type=lmms_eval_specific_kwargs["query_type"]
     )
-    return query_prompt
+    post_prompt = lmms_eval_specific_kwargs.get("post_prompt", "")
+    return query_prompt + post_prompt
 
 
 def mathverse_process_results(doc, results):

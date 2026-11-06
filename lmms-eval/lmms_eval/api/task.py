@@ -13,44 +13,23 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from glob import glob
-from typing import (
-    Any,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Literal,
-    Mapping,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Mapping, Optional, Tuple, Union
 
 import datasets
 import numpy as np
 from accelerate import Accelerator
 from datasets import DownloadConfig, Image, Sequence
 from huggingface_hub import snapshot_download
+from lmms_eval import utils
+from lmms_eval.api import samplers
+from lmms_eval.api.instance import Instance
+from lmms_eval.api.registry import AGGREGATION_REGISTRY, DEFAULT_METRIC_REGISTRY, METRIC_REGISTRY, OUTPUT_TYPE_REGISTRY, get_aggregation, get_metric, get_metric_aggregation, is_higher_better
+from lmms_eval.caching.cache import load_from_cache, save_to_cache
+from lmms_eval.filters import build_filter_ensemble
 from loguru import logger as eval_logger
 from PIL import ImageFile
 from tenacity import retry, stop_after_attempt, stop_after_delay, wait_fixed
 from tqdm import tqdm
-
-from lmms_eval import utils
-from lmms_eval.api import samplers
-from lmms_eval.api.instance import Instance
-from lmms_eval.api.registry import (
-    AGGREGATION_REGISTRY,
-    DEFAULT_METRIC_REGISTRY,
-    METRIC_REGISTRY,
-    OUTPUT_TYPE_REGISTRY,
-    get_aggregation,
-    get_metric,
-    get_metric_aggregation,
-    is_higher_better,
-)
-from lmms_eval.caching.cache import load_from_cache, save_to_cache
-from lmms_eval.filters import build_filter_ensemble
 
 # HuggingfaceM4/NoCaps contains truncated image in test split
 # Include this inside code block to avoid error
@@ -1034,7 +1013,23 @@ class ConfigurableTask(Task):
             if "create_link" in dataset_kwargs:
                 dataset_kwargs.pop("create_link")
 
-        if dataset_kwargs is not None and "load_from_disk" in dataset_kwargs and dataset_kwargs["load_from_disk"]:
+        local_root = os.environ.get("MSD_EVAL_DATA_ROOT")
+        local_dataset_names = {
+            ("lmms-lab/VQAv2", None): "vqav2",
+            ("lmms-lab/ai2d", None): "ai2d",
+            ("lmms-lab/ScienceQA", "ScienceQA-IMG"): "scienceqa_img",
+            ("lmms-lab/ChartQA", None): "chartqa",
+            ("lmms-lab/textvqa", None): "textvqa_val",
+            ("lmms-lab/HallusionBench", None): "hallusion_bench_image",
+            ("lmms-lab/MMBench", "en"): "mmbench_en_test",
+        }
+        local_name = local_dataset_names.get((self.DATASET_PATH, self.DATASET_NAME))
+        if local_root and local_name:
+            local_path = os.path.join(os.path.expanduser(local_root), local_name)
+            if not os.path.isdir(local_path):
+                raise FileNotFoundError(f"Local evaluation dataset is missing: {local_path}")
+            self.dataset = datasets.load_from_disk(local_path)
+        elif dataset_kwargs is not None and "load_from_disk" in dataset_kwargs and dataset_kwargs["load_from_disk"]:
             dataset_kwargs.pop("load_from_disk")
             # using local task in offline environment, need to process the online dataset into local format via
             # `ds = load_datasets("lmms-lab/MMMU")`

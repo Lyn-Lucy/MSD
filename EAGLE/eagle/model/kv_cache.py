@@ -84,31 +84,37 @@ def initialize_past_key_values(model):
     """
     # Extracting configuration from the model
     config = model.config
-
-    if not hasattr(config, 'num_key_value_heads'):   # QWen
-        config.num_key_value_heads = config.num_attention_heads
-        config.max_position_embeddings = config.max_position_embeddings // 2
-
     # Initializing the batch size to 1, this can be modified if different batch sizes are required
     batch_size = 1
     # Initializing a tensor to store past keys and values for all layers
 
-    devices=[]
+    if model.language_model.lm_head.in_features == 4096:
+        config.num_key_value_heads = 32
+        config.num_attention_heads = 32
+        config.max_position_embeddings = 4096
+        config.num_hidden_layers = 32
+        config.hidden_size = 4096
+    elif model.language_model.lm_head.in_features == 5120:
+        config.num_key_value_heads = 40
+        config.num_attention_heads = 40
+        config.max_position_embeddings = 4096
+        config.num_hidden_layers = 40
+        config.hidden_size = 5120
+
+    devices = []
     for i in range(config.num_hidden_layers):
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
+        try:
             device = model.model.layers[i].self_attn.q_proj.weight.device
-        elif hasattr(model, "model") and hasattr(model.model, "h"):
-            device = model.model.h[-1].attn.c_attn.weight.device
-        elif hasattr(model, "layers"):
+        except:
             device = model.layers[i].self_attn.q_proj.weight.device
-        elif hasattr(model, "h"):
-            device = model.h[-1].attn.c_attn.weight.device
         devices.append(device)
-    past_key_values_data_list=[]
-    startnum=0
-    startdevice=devices[0]
-    for id,i in enumerate(devices):
-        if startdevice!=i:
+    past_key_values_data_list = []
+    startnum = 0
+    startdevice = devices[0]
+    for id, i in enumerate(devices):
+        assert i.type == "cuda"  # TODO
+
+        if startdevice != i:
             past_key_values_data = torch.zeros(
                 startnum * 2,
                 batch_size,
@@ -120,7 +126,7 @@ def initialize_past_key_values(model):
             )
             past_key_values_data_list.append(past_key_values_data)
             startdevice = i
-            startnum=0
+            startnum = 0
         startnum += 1
     past_key_values_data = torch.zeros(
         startnum * 2,
@@ -140,27 +146,34 @@ def initialize_past_key_values(model):
     # Creating a KVCache for each pair of key and value in all layers
     past_key_values = [] * config.num_hidden_layers
 
-    bias=0
-    start_data_m=devices[0].index
+    bias = 0
+    start_data_m = devices[0].index
     for i in range(config.num_hidden_layers):
-        data_m=devices[i].index
-        if data_m!=start_data_m:
-            bias=0
-            start_data_m=data_m
+        data_m = devices[i].index
+        if data_m != start_data_m:
+            bias = 0
+            start_data_m = data_m
         try:
             past_key_values.append(
                 [
-                    KVCache(past_key_values_data_list[data_m-devices[0].index][2*bias + j], current_length_data[i * 2 + j])
+                    KVCache(
+                        past_key_values_data_list[data_m - devices[0].index][
+                            2 * bias + j
+                        ],
+                        current_length_data[i * 2 + j],
+                    )
                     for j in range(2)
                 ]
             )
         except:
             past_key_values.append(
                 [
-                    KVCache(past_key_values_data_list[0][2 * bias + j],
-                            current_length_data[i * 2 + j])
+                    KVCache(
+                        past_key_values_data_list[0][2 * bias + j],
+                        current_length_data[i * 2 + j],
+                    )
                     for j in range(2)
                 ]
             )
-        bias+=1
+        bias += 1
     return past_key_values, past_key_values_data_list, current_length_data

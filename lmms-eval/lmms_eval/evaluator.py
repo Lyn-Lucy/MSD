@@ -10,40 +10,20 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Union
 
+import lmms_eval.api
+import lmms_eval.api.metrics
+import lmms_eval.api.registry
 import numpy as np
 import torch
 import torch.distributed as dist
 from datasets import Image, Sequence
-from loguru import logger as eval_logger
-from tqdm import tqdm
-
-import lmms_eval.api
-import lmms_eval.api.metrics
-import lmms_eval.api.registry
-from lmms_eval.evaluator_utils import (
-    consolidate_group_results,
-    consolidate_results,
-    get_sample_size,
-    get_subtask_list,
-    get_task_list,
-    prepare_print_tasks,
-    print_writeout,
-    run_task_tests,
-)
+from lmms_eval.evaluator_utils import consolidate_group_results, consolidate_results, get_sample_size, get_subtask_list, get_task_list, prepare_print_tasks, print_writeout, run_task_tests
 from lmms_eval.loggers.evaluation_tracker import EvaluationTracker
 from lmms_eval.models import get_model
 from lmms_eval.tasks import TaskManager, get_task_dict
-from lmms_eval.utils import (
-    create_iterator,
-    get_datetime_str,
-    get_git_commit_hash,
-    handle_non_serializable,
-    hash_string,
-    make_table,
-    positional_deprecated,
-    run_task_tests,
-    simple_parse_args_string,
-)
+from lmms_eval.utils import create_iterator, get_datetime_str, get_git_commit_hash, handle_non_serializable, hash_string, make_table, positional_deprecated, run_task_tests, simple_parse_args_string
+from loguru import logger as eval_logger
+from tqdm import tqdm
 
 
 @positional_deprecated
@@ -466,11 +446,22 @@ def evaluate(
             for _ in range(padding_requests[reqtype]):
                 cloned_reqs.extend([req] * req.repeats)
 
+        # Measure the complete request loop, including preprocessing, on each rank.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+        model = lm.model
+        accept_before = getattr(model, "acclen", 0)
+        count_before = getattr(model, "accnum", 0)
         resps = getattr(lm, reqtype)(cloned_reqs)
-
-        if hasattr(lm.model, "acclen") and lm.model.accnum > 0:
-            acceptance_len = ((lm.model.acclen / lm.model.accnum) + 1)
-            eval_logger.success(f"The acceptance length is {acceptance_len:.2f}")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        eval_logger.info(f"Total generation time: {elapsed:.6f} seconds")
+        accepted = getattr(model, "acclen", 0) - accept_before
+        steps = getattr(model, "accnum", 0) - count_before
+        if steps > 0:
+            eval_logger.success(f"Avg accepted len: {accepted / steps + 1:.6f}")
 
         # put responses from model into a list of length K for each request.
         for x, req in zip(resps, cloned_reqs):

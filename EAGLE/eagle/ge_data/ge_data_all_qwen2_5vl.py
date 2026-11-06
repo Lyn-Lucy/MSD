@@ -1,5 +1,12 @@
 import argparse
-from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+# from transformers import AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--start', type=int, default=0)
@@ -160,8 +167,10 @@ def build_dataset_rank(
 
 
 
-
-model = Qwen2VLForConditionalGeneration.from_pretrained(modelname, device_map="auto", torch_dtype=torch.bfloat16).eval()
+model = AutoModelForImageTextToText.from_pretrained(
+    modelname, device_map="auto", torch_dtype="auto"
+)
+model.eval()
 processor = AutoProcessor.from_pretrained(modelname, max_pixels=12845056, min_pixels=3136)
 tokenizer = AutoTokenizer.from_pretrained(modelname, trust_remote_code=True)
 
@@ -210,18 +219,38 @@ def ge(data):
         max_length=2048, 
         truncation=True
     )
-    input_ids = inputs.input_ids
-    if "pixel_values" in inputs:
-        pixel_values = inputs.pixel_values
-        image_grid_thw = inputs.image_grid_thw
-        input_embeds = get_input_embeds_qwen2vl(input_ids.cuda(), pixel_values.cuda(), image_grid_thw.cuda(), model)
-    else:
-        input_embeds = get_input_embeds_qwen2vl(input_ids.cuda(), None, None, model)
-    
-    outs_big = model(input_ids.cuda(), output_hidden_states=True)
-    hidden_state_big = outs_big.hidden_states[-1]
-    probs = torch.softmax(outs_big.logits, dim=-1)
-    td={"input_ids":input_ids.cpu()[0],"inputs_embeds":input_embeds.cpu()[0],"hidden_state":hidden_state_big.cpu()[0],"loss_mask":data["loss_mask"].cpu()}
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    # input_ids = inputs.input_ids
+    # if "pixel_values" in inputs:
+    #     pixel_values = inputs.pixel_values
+    #     image_grid_thw = inputs.image_grid_thw
+    #     input_embeds = get_input_embeds_qwen2vl(input_ids.cuda(), pixel_values.cuda(), image_grid_thw.cuda(), model)
+    # else:
+    #     input_embeds = get_input_embeds_qwen2vl(input_ids.cuda(), None, None, model)
+    outs_big = model.generate(
+        **inputs,
+        output_hidden_states=True,
+        return_dict_in_generate=True,
+        max_new_tokens=1,
+    )
+
+    inputs_embeds_big = [x[0] for x in outs_big.hidden_states]
+    inputs_embeds_big = torch.cat(inputs_embeds_big, dim=1)
+    hidden_state_big = [x[-1] for x in outs_big.hidden_states]
+    hidden_state_big = torch.cat(hidden_state_big, dim=1)
+
+
+    td = {
+        "input_ids": data["input_ids"].cpu(),
+        "inputs_embeds": inputs_embeds_big.cpu()[0],
+        "hidden_state": hidden_state_big.cpu()[0],
+        "loss_mask": data["loss_mask"].cpu(),
+    }
+
+    # outs_big = model(input_ids.cuda(), output_hidden_states=True)
+    # hidden_state_big = outs_big.hidden_states[-1]
+    # probs = torch.softmax(outs_big.logits, dim=-1)
+    # td={"input_ids":input_ids.cpu()[0],"inputs_embeds":input_embeds.cpu()[0],"hidden_state":hidden_state_big.cpu()[0],"loss_mask":data["loss_mask"].cpu()}
     return td
 
 outdir = f'{args.outdir}/{args.index}'

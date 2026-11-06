@@ -7,11 +7,14 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 import os
-from transformers import PreTrainedModel, PretrainedConfig,AutoConfig
+from transformers import PreTrainedModel, PretrainedConfig, AutoConfig
 
 
 from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
-from .modeling_qwen2vl_kv import Qwen2VLForConditionalGeneration as KVQwen2VLForCausalLM 
+# from .modeling_qwen2vl_kv import Qwen2VLForConditionalGeneration as KVQwen2VLForCausalLM 
+from .modeling_qwen2_5_vl_kv import (
+    Qwen2_5_VLForConditionalGeneration as KVQwen2_5_VLForConditionalGeneration,
+)
 from .utils import *
 from .kv_cache import initialize_past_key_values
 
@@ -97,6 +100,7 @@ class EaModel(nn.Module):
             **kwargs,
     ):
         #assert Type=="LLaMA" or "Mixtral"
+        from transformers import PreTrainedModel, PretrainedConfig, AutoConfig
         Type=AutoConfig.from_pretrained(base_model_path, trust_remote_code=True).architectures[0]
         if Type=='LlamaForCausalLM':
             base_model = KVLlamaForCausalLM.from_pretrained(
@@ -112,6 +116,30 @@ class EaModel(nn.Module):
             base_model=KVQwen2VLForCausalLM.from_pretrained(
                 base_model_path, **kwargs
             )
+        elif Type == "LlavaNextForConditionalGeneration":
+            from .modeling_llava16_kv import (
+                CustomLlavaNextForConditionalGeneration as KVLlavaNextForConditionalGeneration,
+            )
+            base_model = KVLlavaNextForConditionalGeneration.from_pretrained(
+                base_model_path, **kwargs
+            )
+            base_model.model = base_model.language_model.model
+            base_model.lm_head = base_model.language_model.lm_head
+        elif Type=='LlavaForConditionalGeneration':
+            from .modeling_llava_kv import CustomLlavaForConditionalGeneration as KVLlavaForConditionalGeneration
+            base_model = KVLlavaForConditionalGeneration.from_pretrained(
+                base_model_path, **kwargs
+            )
+            base_model.model = base_model.language_model.model
+            base_model.lm_head = base_model.language_model.lm_head
+        elif Type == "Qwen2_5_VLForConditionalGeneration":
+            base_model = KVQwen2_5_VLForConditionalGeneration.from_pretrained(
+                base_model_path, **kwargs
+            )
+            base_model.language_model = base_model.model
+            base_model.language_model.lm_head = base_model.lm_head
+            # base_model.lm_head = base_model.language_model.lm_head
+            
 
         configpath=os.path.join(ea_model_path,"config.json")
         if not os.path.exists(configpath):
@@ -219,7 +247,7 @@ class EaModel(nn.Module):
             max_length=2048,
             log=False,
     ):
-        
+        acceptance_len = []
         max_length=max_length-self.ea_layer.total_tokens-10
 
         if temperature > 1e-5:
@@ -230,6 +258,7 @@ class EaModel(nn.Module):
         # Avoid modifying the input_ids in-place
 
         padding=(torch.zeros(1,1,dtype=torch.long)-1).to(input_ids.device)
+        original_input_ids = input_ids
         input_ids = input_ids.clone()
         self.ea_layer.reset_kv()
 
@@ -252,11 +281,11 @@ class EaModel(nn.Module):
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
 
-        input_len = input_ids.shape[1]
         reset_tree_mode(self)
-        draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token = initialize_tree(
+        draft_tokens, retrieve_indices,tree_mask,tree_position_ids, logits, hidden_state, sample_token, input_ids = initialize_tree(
             input_ids, self, past_key_values, logits_processor ,inputs_embeds
         )
+        input_len = input_ids.shape[1]
         new_token = 0
 
         for idx in range(max_length):
@@ -280,6 +309,7 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            acceptance_len.append(int(accept_length))
             self.acclen += accept_length
             self.accnum += 1
             # print(accept_length)
@@ -307,10 +337,12 @@ class EaModel(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        # Public generation results always retain the original, uncompressed prompt.
+        input_ids = torch.cat((original_input_ids, input_ids[:, input_len:]), dim=1)
         if not log:
-            return input_ids
+            return input_ids, new_token, idx, acceptance_len
         else:
-            return input_ids, new_token, idx
+            return input_ids, new_token, idx,
 
 
     @torch.no_grad()
@@ -359,9 +391,9 @@ class EaModel(nn.Module):
         reset_tree_mode(self)
 
         if inputs_embeds is not None:
-            if self.base_model.config.model_type == "qwen2_vl": 
+            if self.base_model.config.model_type == "qwen2_5_vl": 
                 outputs = self.base_model(input_ids=input_ids, inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
-            elif self.base_model.config.model_type == "llava":
+            elif self.base_model.config.model_type == "llava" or self.base_model.config.model_type == "llava_next":
                 outputs = self.base_model(input_ids=None, inputs_embeds=inputs_embeds, past_key_values=past_key_values, use_cache=True)
         else:
             outputs = self.base_model(input_ids, past_key_values=past_key_values, use_cache=True)
@@ -392,4 +424,3 @@ class EaModel(nn.Module):
             return input_ids
         else:
             return input_ids, new_token, idx
-

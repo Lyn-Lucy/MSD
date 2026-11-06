@@ -10,8 +10,34 @@ datas/
 logs/
 llava_pretrain_regen/
 .venv-msd-eval/
-logs_*/
+/logs*/
 
 # Local training checkpoints
 /ckpt/
 /ckpt_*/
+
+# Local assets and generated outputs
+*.egg-info/
+*.out
+*.log
+/.vscode
+/models
+/eval_data/
+/output/
+/tmm/
+
+/figure/
+/.env
+/.env.*
+!.env.example
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Python environments, caches and local tooling
+/.venv/
+/venv/
+/.idea/
+.pytest_cache/
+.cache/

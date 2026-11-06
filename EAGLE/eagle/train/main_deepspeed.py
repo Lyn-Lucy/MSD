@@ -17,17 +17,24 @@ from tqdm import tqdm
 # import accelerate
 import numpy as np
 import random
+import torch.nn.functional as F
 
 
 def get_embed(path):
     try:
         with open(os.path.join(path, "model.safetensors.index.json"), "r") as f:
             index_json = json.loads(f.read())
-            embed_path = index_json["weight_map"]["model.embed_tokens.weight"]
+            try:
+                embed_path = index_json["weight_map"]["language_model.embed_tokens.weight"]
+            except:
+                embed_path = index_json["weight_map"]["model.embed_tokens.weight"]
         with safe_open(os.path.join(path, embed_path),
                     framework="pt",
                     device="cpu") as f:
-            tensor_slice = f.get_slice("model.embed_tokens.weight")
+            try:
+                tensor_slice = f.get_slice("language_model.model.embed_tokens.weight")
+            except:
+                tensor_slice = f.get_slice("model.embed_tokens.weight")
             vocab_size, hidden_dim = tensor_slice.get_shape()
             tensor = tensor_slice[:, :hidden_dim].float()
     except:
@@ -84,9 +91,9 @@ def main():
     parser = argparse.ArgumentParser(description='sp')
     parser.add_argument('--basepath', type=str, default=None)
     parser.add_argument('--tmpdir_v', type=str,
-                        default='/home/llx/spd/eagle_data', help="visual instruction-tuning dataset")
+                        required=True, help="visual instruction-tuning dataset")
     parser.add_argument('--tmpdir_t', type=str,
-                        default='/home/llx/spd/eagle_data', help="text_only instruction-tuning dataset")
+                        required=True, help="text_only instruction-tuning dataset")
     parser.add_argument('--config', type=str, default='llava_v15_7B_config.json')
     parser.add_argument('--cpdir', type=str, default="", help="The path to save the model")
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for distributed training on gpus")
@@ -103,7 +110,7 @@ def main():
         "datapath_v": f"{args.tmpdir_v}",
         "datapath_t": f"{args.tmpdir_t}",
         "is_warmup": True,
-        "num_epochs": 20 * 2,
+        "num_epochs": 20,
         "num_warmup_steps": 2000,
         "total_steps": 800000,
         "p_w": 0.1,
@@ -117,7 +124,7 @@ def main():
         "mean": 0.0,
         "std": 0.2,
         "residual": "true,norm",
-        "max_len": 2048,
+        "max_len": 4096,
         # "config_path": "/data/llx/code/spd_7b/EAGLE/eagle/train/llava_v15_7B_config.json",
         "config_path": f"{args.config}",
         "b1": 0.9,
@@ -126,7 +133,7 @@ def main():
     }
 
     debug = args.debug
-
+    pool_kernel_size = 4
 
     torch.backends.cuda.matmul.allow_tf32 = True
     from accelerate import Accelerator
@@ -140,16 +147,55 @@ def main():
     rank = torch.distributed.get_rank()
     if rank == 0:
         import wandb
-        wandb.init(project="llava_eagle_13b", config=train_config)
+        import shutil
+        from datetime import datetime  # 1. 导入 datetime
+
+        if args.debug:
+            # 2. 定义你的专属名称
+            custom_name = "debug"
+        else:
+            # custom_name = f"llava_v15_7b_ori_pool_{pool_kernel_size}" 
+            custom_name = f"qwen25_7b_base" 
+
+        # 4. 组合成一个唯一的 run ID
+        run_id = f"{custom_name}"
+
+        run = wandb.init(project="llava_eagle_13b", config=train_config, id=run_id)  # mode 可以切换 offline/online
+
+        from pathlib import Path
+
+        eagle_root = Path(__file__).resolve().parents[1]
+        files_to_save = [
+            str(Path(__file__).resolve()),
+            str(eagle_root / "model" / "cnets.py"),
+            str(eagle_root / "train" / "ds_config.json"),
+        ]
+
+        for src in files_to_save:
+            # 目标路径（wandb 本地 run 目录下的 files/ 子目录）
+            dst_dir = os.path.join(run.dir, "files", os.path.dirname(src).split("eagle/")[-1])
+            os.makedirs(dst_dir, exist_ok=True)
+            
+            # 复制文件为硬拷贝
+            shutil.copy2(src, dst_dir)
+            
+            # 保存到 wandb（会上传副本）
+            wandb.save(os.path.join(dst_dir, os.path.basename(src)))
 
     try:
         with open(os.path.join(args.basepath, "model.safetensors.index.json"), "r") as f:
             index_json = json.loads(f.read())
-            head_path = index_json["weight_map"]["lm_head.weight"]
+            try:
+                head_path = index_json["weight_map"]["language_model.lm_head.weight"]
+            except:
+                head_path = index_json["weight_map"]["lm_head.weight"]
         with safe_open(os.path.join(args.basepath, head_path),
                     framework="pt",
                     device="cpu") as f:
-            tensor_slice = f.get_slice("lm_head.weight")
+            try:
+                tensor_slice = f.get_slice("language_model.lm_head.weight")
+            except:
+                tensor_slice = f.get_slice("lm_head.weight")
             vocab_size, hidden_dim = tensor_slice.get_shape()
             tensor = tensor_slice[:, :hidden_dim].float()
     except:
@@ -202,19 +248,145 @@ def main():
 
             data = self.load_data(index, dataset)
             new_data = {}
-            hidden_state = data['hidden_state'][:train_config["max_len"]][None, :]
-            input_ids = data['input_ids'][:train_config["max_len"]][None, :]
-            loss_mask = data["loss_mask"][:train_config["max_len"]][None, :]
+            hidden_state = data['hidden_state'][None, :]
+            input_ids = data['input_ids'][None, :]
+            loss_mask = data["loss_mask"][None, :]
             if "inputs_embeds" in data.keys():
-                inputs_embeds = data["inputs_embeds"][:train_config["max_len"]][None, :]
+                inputs_embeds = data["inputs_embeds"][None, :]
             else:
                 inputs_embeds = embedding(input_ids).to(torch.bfloat16)
 
             image_tokens_num = 0
-            if -200 in input_ids:
-                image_tokens_num = 576
-            elif 151652 in input_ids:
+
+            if 151655 in input_ids:
                 image_tokens_num = (input_ids == 151655).sum().item()
+            # ======== 视觉 Token 剪枝部分 ========
+            # ==============================batch-kmeans=========================
+            # if (input_ids == 151655).any():
+            #     visual_mask = (input_ids == 151655)
+            #     text_mask = ~visual_mask
+
+            #     # 索引与形状
+            #     visual_indices = torch.nonzero(visual_mask.squeeze(), as_tuple=False).squeeze(1)  # [N_vis]
+            #     text_indices = torch.nonzero(text_mask.squeeze(), as_tuple=False).squeeze(1)
+            #     N_vis = visual_indices.numel()
+            #     H = hidden_state.shape[-1]
+
+            #     # N_vis <= 1 则无需处理
+            #     if N_vis > 1:
+            #         # 取出视觉部分特征
+            #         vis_inputs = inputs_embeds[:, visual_indices, :].squeeze(0).to(torch.float32)      # [N_vis, H]
+            #         vis_hidden = hidden_state[:, visual_indices, :].squeeze(0).to(torch.float32)      # [N_vis, H]
+                    
+            #         # ===============================
+            #         # 🚀 Mini-batch 近似 KMeans 聚类压缩
+            #         # ===============================
+            #         K = min(32, N_vis)  # 你可以自由调整保留的视觉token数
+            #         perm = torch.randperm(N_vis, device=vis_inputs.device)
+            #         centers = vis_inputs[perm[:K]]  # [K, H] 随机初始化聚类中心
+
+            #         dist = torch.cdist(vis_inputs, centers, p=2)   # [N_vis, K]
+            #         assignments = dist.argmin(dim=-1)              # [N_vis]
+
+            #         # scatter 向量化求均值聚合
+            #         counts = torch.bincount(assignments, minlength=K).clamp(min=1).unsqueeze(1).to(vis_inputs.device)
+            #         merged_sum_hidden = torch.zeros(K, H, device=vis_hidden.device)
+            #         merged_sum_inputs = torch.zeros(K, H, device=vis_inputs.device)
+
+            #         merged_sum_hidden = merged_sum_hidden.index_add(0, assignments, vis_hidden)
+            #         merged_sum_inputs = merged_sum_inputs.index_add(0, assignments, vis_inputs)
+
+            #         merged_hidden = merged_sum_hidden / counts  # [K, H]
+            #         merged_inputs = merged_sum_inputs / counts  # [K, H]
+
+            #         # ===============================
+            #         # 构造视觉token id 与 loss_mask
+            #         # ===============================
+            #         vis_ids_multi = torch.full((1, K), 151655, dtype=input_ids.dtype, device=input_ids.device)
+            #         vis_loss_val = loss_mask[:, visual_indices[:K]]  # [1, K]
+
+            #         # 判断视觉token是否为连续块（通常是）
+            #         vis_sorted = torch.sort(visual_indices).values
+            #         is_contiguous = (vis_sorted[-1] - vis_sorted[0] + 1 == vis_sorted.numel()) and \
+            #                         (torch.diff(vis_sorted).min() == 1)
+
+            #         if is_contiguous:
+            #             first_vis = vis_sorted[0].item()
+            #             last_vis  = vis_sorted[-1].item()
+
+            #             pre_text_idx  = text_indices[text_indices < first_vis]
+            #             post_text_idx = text_indices[text_indices > last_vis]
+
+            #             # 拼接：前文本 + 聚类视觉 + 后文本
+            #             input_ids = torch.cat([
+            #                 input_ids[:, pre_text_idx],
+            #                 vis_ids_multi,
+            #                 input_ids[:, post_text_idx]
+            #             ], dim=1)
+
+            #             hidden_state = torch.cat([
+            #                 hidden_state[:, pre_text_idx, :],
+            #                 merged_hidden.unsqueeze(0).to(hidden_state.dtype),
+            #                 hidden_state[:, post_text_idx, :]
+            #             ], dim=1)
+
+            #             inputs_embeds = torch.cat([
+            #                 inputs_embeds[:, pre_text_idx, :],
+            #                 merged_inputs.unsqueeze(0).to(inputs_embeds.dtype),
+            #                 inputs_embeds[:, post_text_idx, :]
+            #             ], dim=1)
+
+            #             loss_mask = torch.cat([
+            #                 loss_mask[:, pre_text_idx],
+            #                 vis_loss_val,
+            #                 loss_mask[:, post_text_idx]
+            #             ], dim=1)
+            #         else:
+            #             # 若非连续，安全兜底：文本保持原序，视觉token追加到末尾
+            #             sorted_text_idx = torch.sort(text_indices).values
+
+            #             input_ids = torch.cat([
+            #                 input_ids[:, sorted_text_idx],
+            #                 vis_ids_multi
+            #             ], dim=1)
+
+            #             hidden_state = torch.cat([
+            #                 hidden_state[:, sorted_text_idx, :],
+            #                 merged_hidden.unsqueeze(0).to(hidden_state.dtype)
+            #             ], dim=1)
+
+            #             inputs_embeds = torch.cat([
+            #                 inputs_embeds[:, sorted_text_idx, :],
+            #                 merged_inputs.unsqueeze(0).to(inputs_embeds.dtype)
+            #             ], dim=1)
+
+            #             loss_mask = torch.cat([
+            #                 loss_mask[:, sorted_text_idx],
+            #                 vis_loss_val
+            #             ], dim=1)
+
+            #     # 更新视觉token数量统计
+            #     image_tokens_num = (input_ids == 151655).sum().item()
+            # ==============================only text=========================
+            # if (input_ids == 151655).any():
+            #     # 视觉 token mask
+            #     visual_mask = (input_ids[0] == 151655)
+            #     text_mask = ~visual_mask  # 只保留非 151655 的位置
+
+            #     # 直接筛选出文本部分
+            #     input_ids = input_ids[:, text_mask]
+            #     hidden_state = hidden_state[:, text_mask, :]
+            #     inputs_embeds = inputs_embeds[:, text_mask, :]
+            #     loss_mask = loss_mask[:, text_mask]
+
+            #     # 更新视觉 token 数量（现在为 0）
+            #     image_tokens_num = 0
+
+            input_ids = input_ids[:, :train_config["max_len"]]
+            inputs_embeds = inputs_embeds[:, :train_config["max_len"], :]
+            hidden_state = hidden_state[:, :train_config["max_len"], :]
+            loss_mask = loss_mask[:, :train_config["max_len"]]
+                
 
             length = hidden_state.shape[1]
             attention_mask = [1] * length
@@ -261,7 +433,7 @@ def main():
 
         def paddingtensor2D(self, intensors, N, have_img=False):
             if have_img == True:
-                img_padding_tensor = torch.zeros(intensors.shape[0], 575, dtype=intensors.dtype)
+                img_padding_tensor = torch.zeros(intensors.shape[0], 576 // (pool_kernel_size*pool_kernel_size) - 1, dtype=intensors.dtype)
                 intensors = torch.cat((img_padding_tensor, intensors), dim=1)
             if intensors.shape[1] >= train_config["max_len"]:
                 intensors = intensors[:,:train_config["max_len"]]
@@ -348,8 +520,8 @@ def main():
     datapath_t = list_files(train_config["datapath_t"])
 
     if debug == True:
-        traindatapath_v = datapath_v[:100]
-        traindatapath_t = datapath_t[:100]
+        traindatapath_v = datapath_v[:10]
+        traindatapath_t = datapath_t[:10]
         testdatapath_v = datapath_v[100:110]
         testdatapath_t = datapath_t[100:110]
     else:
@@ -372,7 +544,7 @@ def main():
     else:
         config = EConfig.from_pretrained(train_config["config_path"])
 
-    model = Model(config, path=args.basepath, load_emb=True, train_embed=False, decouple=True)
+    model = Model(config, path=args.basepath, load_emb=True, init=False, train_embed=False, decouple=False)
     zeropadding_embed = model.embed_tokens(torch.tensor(0))[None, None, :].to(dtype=(torch.bfloat16 if use_bf16 else torch.float16)).detach() 
 
     criterion = nn.SmoothL1Loss(reduction="none")
@@ -410,7 +582,6 @@ def main():
         for batch_idx, data in enumerate(tqdm(train_loader)):
 
             model.zero_grad()
-
             predict = model_engine(data["hidden_states"].to(rank), input_ids=data["input_ids"].to(rank),
                                 inputs_embeds=data["inputs_embeds"].to(rank),
                                 attention_mask=data["attention_mask"].to(rank),
@@ -474,7 +645,7 @@ def main():
         # if epoch % 10 == 0:
         #     deepspeed.DeepSpeedEngine.save_checkpoint(model_engine, save_dir=f"{args.cpdir}/state_{epoch}")
         if debug == False:
-            name = "llava_v15_7b_msd"
+            name = f"qwen25_7b_base0"
             model_engine.save_16bit_model(f"{args.cpdir}/{name}_{epoch}")
             torch.distributed.barrier()
             config = train_config["config_path"]

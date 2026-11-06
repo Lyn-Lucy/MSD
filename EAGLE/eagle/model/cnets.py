@@ -85,7 +85,7 @@ def len_list(x, n):
 
 
 class Model(nn.Module):
-    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0, train_embed=False, decouple=False):
+    def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0, init=False, train_embed=False, decouple=False, init_checkpoint=None):
         super().__init__()
 
         self.gradient_checkpointing = True
@@ -115,6 +115,18 @@ class Model(nn.Module):
             self.layers = nn.ModuleList([Qwen2VLDecoderLayer(config, index) for index in range(config.num_hidden_layers)])
             self.rotary_emb = Qwen2VLRotaryEmbedding(config=config)
 
+        if init:
+            if init_checkpoint is None:
+                raise ValueError("init_checkpoint must be provided when init=True")
+            checkpoint = torch.load(init_checkpoint, map_location="cpu")
+            # 遍历所有层，将每一层的权重手动加载到 self.layers 中
+            for i in range(config.num_hidden_layers):
+                layer_prefix = f"layers.{i}"  # 每一层的前缀
+                layer_dict = {k.replace(f"{layer_prefix}.", ""): v for k, v in checkpoint.items() if k.startswith(layer_prefix)}
+
+                # 将当前层的权重加载到 self.layers[i] 中
+                self.layers[i].load_state_dict(layer_dict)
+        
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=bias)
         self.act = ACT2FN[config.hidden_act]
         self.logsoftmax = nn.LogSoftmax(dim=-1)
@@ -186,68 +198,82 @@ class Model(nn.Module):
         # with torch.no_grad():
         from eagle.model.utils import temp_cache
 
-        if any(p.requires_grad for p in self.embed_tokens.parameters()):
-            # Iterate over each input_ids in the batch
-            new_inputs_embeds_list = []
-            for batch_idx in range(input_ids.size(0)):
-                single_input_ids = input_ids[batch_idx]  # Extract current sample's input_ids
-                if -200 in single_input_ids:
-                    # Extract the part that needs processing
-                    ori_input_ids = single_input_ids[image_tokens_num[batch_idx] - 1:]
-                    indice = (ori_input_ids == -200).nonzero(as_tuple=False).flatten().to(ori_input_ids.device)
-                    # Mask to exclude -200
-                    mask = (ori_input_ids != -200)
-                    ori_input_ids = ori_input_ids[mask]  # Reshape to 1D
-                    # Get embeddings
-                    inputs_ids_embeds = self.embed_tokens(ori_input_ids)  # Embed only the part without -200
-                    indice = indice.item()  # Index position
-                    # Extract a segment of length 576
-                    extracted_segment = inputs_embeds[batch_idx, indice:indice + image_tokens_num[batch_idx]]
-                    # Insert back the extracted segment into ori_input_ids embeddings
-                    inputs_ids_embeds = torch.cat([
-                        inputs_ids_embeds[:indice],     # Part before insertion
-                        extracted_segment,              # Extracted segment
-                        inputs_ids_embeds[indice:]      # Part after insertion
-                    ], dim=0).unsqueeze(0)
-                    new_inputs_embeds_list.append(inputs_ids_embeds)
+        # if any(p.requires_grad for p in self.embed_tokens.parameters()):
+        #     # Iterate over each input_ids in the batch
+        #     new_inputs_embeds_list = []
+        #     for batch_idx in range(input_ids.size(0)):
+        #         single_input_ids = input_ids[batch_idx]  # Extract current sample's input_ids
+        #         if -200 in single_input_ids:
+        #             # Extract the part that needs processing
+        #             ori_input_ids = single_input_ids[image_tokens_num[batch_idx] - 1:]
+        #             indice = (ori_input_ids == -200).nonzero(as_tuple=False).flatten().to(ori_input_ids.device)
+        #             # Mask to exclude -200
+        #             mask = (ori_input_ids != -200)
+        #             ori_input_ids = ori_input_ids[mask]  # Reshape to 1D
+        #             # Get embeddings
+        #             inputs_ids_embeds = self.embed_tokens(ori_input_ids)  # Embed only the part without -200
+        #             indice = indice.item()  # Index position
+        #             # Extract a segment of length 576
+        #             extracted_segment = inputs_embeds[batch_idx, indice:indice + image_tokens_num[batch_idx]]
+        #             # Insert back the extracted segment into ori_input_ids embeddings
+        #             inputs_ids_embeds = torch.cat([
+        #                 inputs_ids_embeds[:indice],     # Part before insertion
+        #                 extracted_segment,              # Extracted segment
+        #                 inputs_ids_embeds[indice:]      # Part after insertion
+        #             ], dim=0).unsqueeze(0)
+        #             new_inputs_embeds_list.append(inputs_ids_embeds)
 
-                elif 151652 in single_input_ids:
-                    indice = (single_input_ids == 151652).nonzero(as_tuple=False).flatten().to(single_input_ids.device) + 1
-                    extracted_segment = inputs_embeds[batch_idx, indice:indice + image_tokens_num[batch_idx]]
-                    single_inputs_embeds = self.embed_tokens(single_input_ids.unsqueeze(0))
-                    single_inputs_embeds[0, indice : indice + image_tokens_num[batch_idx]] = extracted_segment
-                    new_inputs_embeds_list.append(single_inputs_embeds)
-                else:
-                    # If no -200 is present, directly get embeddings
-                    single_inputs_embeds = self.embed_tokens(single_input_ids.unsqueeze(0))
-                    new_inputs_embeds_list.append(single_inputs_embeds)
+        #         elif 151652 in single_input_ids:
+        #             indice = (single_input_ids == 151652).nonzero(as_tuple=False).flatten().to(single_input_ids.device) + 1
+        #             extracted_segment = inputs_embeds[batch_idx, indice:indice + image_tokens_num[batch_idx]]
+        #             single_inputs_embeds = self.embed_tokens(single_input_ids.unsqueeze(0))
+        #             single_inputs_embeds[0, indice : indice + image_tokens_num[batch_idx]] = extracted_segment
+        #             new_inputs_embeds_list.append(single_inputs_embeds)
+        #         elif 32000 in single_input_ids:
+        #             indice = (single_input_ids == 32000).nonzero(as_tuple=False).flatten()[0].to(single_input_ids.device)
+        #             extracted_segment = inputs_embeds[batch_idx, indice:indice + image_tokens_num[batch_idx]]
+        #             single_inputs_embeds = self.embed_tokens(single_input_ids.unsqueeze(0))
+        #             single_inputs_embeds[0, indice : indice + image_tokens_num[batch_idx]] = extracted_segment
+        #             new_inputs_embeds_list.append(single_inputs_embeds)
+        #         else:
+        #             # If no -200 is present, directly get embeddings
+        #             single_inputs_embeds = self.embed_tokens(single_input_ids.unsqueeze(0))
+        #             new_inputs_embeds_list.append(single_inputs_embeds)
 
-            # Concatenate the processed results into new inputs_embeds
-            inputs_embeds = torch.cat(new_inputs_embeds_list, dim=0)
+        #     # Concatenate the processed results into new inputs_embeds
+        #     inputs_embeds = torch.cat(new_inputs_embeds_list, dim=0)
 
-        elif temp_cache.use_msd:
-            if -200 in input_ids:    # llava
-                indice = torch.where(input_ids == -200)[1].item()
-                inputs_ids_embeds = self.embed_tokens(
-                    torch.cat((input_ids[:,:indice], input_ids[:,indice+1:]), dim=1)
-                )
-                inputs_embeds = torch.cat(
-                    (inputs_ids_embeds[:,:indice], inputs_embeds[:, indice:indice + image_tokens_num[0]], inputs_ids_embeds[:,indice:]), dim=1
-                )
-            elif 151652 in input_ids and image_tokens_num != None:    # qwen2_vl
-                indice = torch.where(input_ids == 151652)[1].item() + 1
-                inputs_ids_embeds = self.embed_tokens(
-                    torch.cat((input_ids[:,:indice], input_ids[:,indice + image_tokens_num[0]:]), dim=1)
-                )
-                inputs_embeds = torch.cat(
-                    (inputs_ids_embeds[:,:indice], inputs_embeds[:, indice:indice + image_tokens_num[0]], inputs_ids_embeds[:,indice:]), dim=1
-                )
+        # elif temp_cache.use_msd:
+        #     if -200 in input_ids:    # llava
+        #         indice = torch.where(input_ids == -200)[1].item()
+        #         inputs_ids_embeds = self.embed_tokens(
+        #             torch.cat((input_ids[:,:indice], input_ids[:,indice+1:]), dim=1)
+        #         )
+        #         inputs_embeds = torch.cat(
+        #             (inputs_ids_embeds[:,:indice], inputs_embeds[:, indice:indice + image_tokens_num[0]], inputs_ids_embeds[:,indice:]), dim=1
+        #         )
+        #     elif 151655 in input_ids and image_tokens_num != None:    # qwen2_vl
+        #         indice = torch.where(input_ids == 151655)[0][0].item()
+        #         inputs_ids_embeds = self.embed_tokens(
+        #             torch.cat((input_ids[:,:indice], input_ids[:,indice + image_tokens_num[0]:]), dim=1)
+        #         )
+        #         inputs_embeds = torch.cat(
+        #             (inputs_ids_embeds[:,:indice], inputs_embeds[:, indice:indice + image_tokens_num[0]], inputs_ids_embeds[:,indice:]), dim=1
+        #         )
+        #     elif 32000 in input_ids and image_tokens_num != None:    # llava16
+        #         indice = torch.where(input_ids == 32000)[0][0].item()
+        #         inputs_ids_embeds = self.embed_tokens(
+        #             torch.cat((input_ids[:,:indice], input_ids[:,indice + image_tokens_num[0]:]), dim=1)
+        #         )
+        #         inputs_embeds = torch.cat(
+        #             (inputs_ids_embeds[:,:indice], inputs_embeds[:, indice:indice + image_tokens_num[0]], inputs_ids_embeds[:,indice:]), dim=1
+        #         )
 
-            else:
-                inputs_embeds = self.embed_tokens(input_ids)
-        else:
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
+        #     else:
+        #         inputs_embeds = self.embed_tokens(input_ids)
+        # else:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
 
 
         if past_key_values is not None:
@@ -282,16 +308,23 @@ class Model(nn.Module):
                     inputs_embeds[i][indice] = inputs_embeds[i][indice + image_tokens_num[i]]
                     hidden_states[i] = self.fc(torch.cat((inputs_embeds[i], hidden_states[i]), dim=-1))
                     hidden_states[i][indice : indice + image_tokens_num[i]] = temp_image_tensor
-                elif 151652 in input_ids[i]:
+                elif 151655 in input_ids[i]:
                     ori_input_ids = input_ids[i]
-                    indice = torch.where(ori_input_ids == 151652)[0].item() + 1
+                    indice = torch.where(ori_input_ids == 151655)[0][0].item()
+                    temp_image_tensor = inputs_embeds[i][indice : indice + image_tokens_num[i]].clone()
+                    inputs_embeds[i][indice] = inputs_embeds[i][indice + image_tokens_num[i]]
+                    hidden_states[i] = self.fc(torch.cat((inputs_embeds[i], hidden_states[i]), dim=-1))
+                    hidden_states[i][indice : indice + image_tokens_num[i]] = temp_image_tensor
+                elif 32000 in input_ids[i]:
+                    ori_input_ids = input_ids[i]
+                    indice = torch.where(ori_input_ids == 32000)[0][0].item()
                     temp_image_tensor = inputs_embeds[i][indice : indice + image_tokens_num[i]].clone()
                     inputs_embeds[i][indice] = inputs_embeds[i][indice + image_tokens_num[i]]
                     hidden_states[i] = self.fc(torch.cat((inputs_embeds[i], hidden_states[i]), dim=-1))
                     hidden_states[i][indice : indice + image_tokens_num[i]] = temp_image_tensor
                 else:
                     hidden_states[i] = self.fc(torch.cat((inputs_embeds[i], hidden_states[i]), dim=-1))
-        elif temp_cache.use_msd:
+        elif temp_cache.use_msd and temp_cache.decouple and image_tokens_num != None:
             input_ids = input_ids[0]
             inputs_embeds = inputs_embeds[0]
             hidden_states = hidden_states[0]
@@ -306,7 +339,16 @@ class Model(nn.Module):
                 new_hidden_state[indice : indice + image_tokens_num[0]] = temp_image_tensor
             elif 151652 in input_ids and image_tokens_num != None:
                 ori_input_ids = input_ids
-                indice = torch.where(ori_input_ids == 151652)[0].item() + 1
+                indice = torch.where(ori_input_ids == 151652)[0][0].item() + 1
+                temp_image_tensor = inputs_embeds[indice : indice + image_tokens_num[0]].clone()
+                new_hidden_state = hidden_states.clone()
+                inputs_embeds[indice] = inputs_embeds[indice + image_tokens_num[0]]
+                cat_tensor = torch.cat((inputs_embeds, new_hidden_state), dim=-1)
+                new_hidden_state = self.fc(cat_tensor)
+                new_hidden_state[indice : indice + image_tokens_num[0]] = temp_image_tensor
+            elif 32000 in input_ids and image_tokens_num != None:
+                ori_input_ids = input_ids
+                indice = torch.where(ori_input_ids == 32000)[0][0].item()
                 temp_image_tensor = inputs_embeds[indice : indice + image_tokens_num[0]].clone()
                 new_hidden_state = hidden_states.clone()
                 inputs_embeds[indice] = inputs_embeds[indice + image_tokens_num[0]]
@@ -321,7 +363,7 @@ class Model(nn.Module):
         else:
             inputs_embeds = inputs_embeds.to(hidden_states.device)
             hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1))
-
+        # torch.cuda.empty_cache()
         all_hidden_states = () if output_hidden_states else None
         next_decoder_cache = () if use_cache else None
 
@@ -377,6 +419,7 @@ class Model(nn.Module):
 
     def reset_kv(self):
         self.stable_kv = None
+        self.stable_attention_mask = None
 
     @torch.no_grad()
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor, inputs_embeds=None):
@@ -403,25 +446,51 @@ class Model(nn.Module):
         len_posi = input_ids.shape[1]
 
         if -200 in input_ids:  # Indicates that an image exists, the actual length is 575
-            len_posi += 575
+            len_posi += (576 - 1)
 
         self.reset()
 
+        stable_attention_mask = None
+        use_visual_padding = temp_cache.pad_visual_span and temp_cache.draft_attention_mask is not None
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             if -200 in input_ids:
-                kv_len -= 575
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-                                               past_key_values=self.stable_kv, use_cache=True, inputs_embeds=inputs_embeds)
+                kv_len -= (576 - 1)
+            # out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+            #                                    past_key_values=self.stable_kv, use_cache=True, inputs_embeds=inputs_embeds)
+            if use_visual_padding:
+                prefix_attention_mask = self.stable_attention_mask
+                if prefix_attention_mask is None:
+                    prefix_attention_mask = torch.ones(
+                        (input_ids.shape[0], kv_len), dtype=torch.bool, device=input_ids.device
+                    )
+                new_attention_mask = torch.ones(
+                    (input_ids.shape[0], hidden_states.shape[1]),
+                    dtype=torch.bool,
+                    device=input_ids.device,
+                )
+                stable_attention_mask = torch.cat(
+                    (prefix_attention_mask.to(input_ids.device), new_attention_mask), dim=1
+                )
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, -hidden_states.shape[1]:],
+                                               past_key_values=self.stable_kv, use_cache=True, inputs_embeds=inputs_embeds,
+                                               attention_mask=stable_attention_mask)
         else:
             image_tokens_num = []
             if -200 in input_ids:
                 image_tokens_num = [576]
             elif 151652 in input_ids:
                 image_tokens_num = [(input_ids == 151655).sum().item()]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True, inputs_embeds=inputs_embeds, image_tokens_num=image_tokens_num)
+            elif 32000 in input_ids:
+                image_tokens_num = [(input_ids == 32000).sum().item()]
+            if use_visual_padding:
+                image_tokens_num = [temp_cache.visual_span_tokens]
+                stable_attention_mask = temp_cache.draft_attention_mask.to(input_ids.device)
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True, inputs_embeds=inputs_embeds,
+                                               image_tokens_num=image_tokens_num, attention_mask=stable_attention_mask)
 
         self.stable_kv = past_key_values
+        self.stable_attention_mask = stable_attention_mask
         last_hidden = out_hidden[:, -1]
 
         last_headout = head(last_hidden)
@@ -436,6 +505,7 @@ class Model(nn.Module):
         input_ids = topk_index
         input_hidden = last_hidden[None].repeat(1, top_k, 1)
         tree_mask = self.tree_mask_init
+        tree_attention_mask = stable_attention_mask
         topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
 
         # 4
@@ -443,8 +513,21 @@ class Model(nn.Module):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
 
+            if tree_attention_mask is not None:
+                tree_attention_mask = torch.cat(
+                    (
+                        tree_attention_mask,
+                        torch.ones(
+                            (tree_attention_mask.shape[0], input_hidden.shape[1]),
+                            dtype=torch.bool,
+                            device=tree_attention_mask.device,
+                        ),
+                    ),
+                    dim=1,
+                )
             out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-                                               position_ids=position_ids, use_cache=True)
+                                               position_ids=position_ids, use_cache=True,
+                                               attention_mask=tree_attention_mask)
             len_posi += 1
 
             # with Timer("sort1"):
