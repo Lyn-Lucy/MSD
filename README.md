@@ -1,36 +1,37 @@
 # Multimodal Speculative Decoding (MSD)
 
 📄 [**Paper on arXiv**](https://arxiv.org/pdf/2505.14260)
+
 *Speculative Decoding Reimagined for Multimodal Large Language Models*
----
 
 ## 🧠 MSD Models
 
-You can directly use the Multimodal Speculative Decoding (MSD) models available on Hugging Face:
+The following repositories contain MSD **draft checkpoints**, to be used with
+these target models and the implementation in this repository.
 
-- **MSD-LLaVA1.5-7B**: [lucylyn/MSD-LLaVA1.5-7B](https://huggingface.co/lucylyn/MSD-LLaVA1.5-7B)
-- **MSD-LLaVA1.5-13B**: [lucylyn/MSD-LLaVA1.5-13B](https://huggingface.co/lucylyn/MSD-LLaVA1.5-13B)
-- **MSD-Qwen2VL-7B-Instruct**: [lucylyn/MSD-Qwen2VL-7B-Instruct](https://huggingface.co/lucylyn/MSD-Qwen2VL-7B-Instruct)
+| Target model | MSD draft checkpoint | Evaluation adapter |
+|---|---|---|
+| [LLaVA-1.5-7B](https://huggingface.co/llava-hf/llava-1.5-7b-hf) | [lucylyn/MSD-LLaVA1.5-7B](https://huggingface.co/lucylyn/MSD-LLaVA1.5-7B) | `llava_hf_msd` |
+| [LLaVA-1.6-7B](https://huggingface.co/llava-hf/llava-v1.6-vicuna-7b-hf) | [lucylyn/MSD-LLaVA1.6-7B](https://huggingface.co/lucylyn/MSD-LLaVA1.6-7B) | `llava_hf_msd` |
+| [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) | [lucylyn/MSD-Qwen2.5VL-7B-Instruct](https://huggingface.co/lucylyn/MSD-Qwen2.5VL-7B-Instruct) | `qwen2_vl_msd` |
 
-
----
+Each draft repository contains `config.json` and `pytorch_model.bin`.
+`--msd_model_path` accepts either a Hugging Face repository ID or a local
+checkpoint directory. MSD uses **KMeans-32 by default** for the draft model's
+visual input; the target model keeps the complete visual input.
 
 ## 🧱 1. Setup & Installation
+
+Use Python 3.10 and a CUDA 12.1-compatible environment. From the repository root:
 
 ```bash
 conda create -n msd python=3.10 -y
 conda activate msd
-# Ensure CUDA 12.1 is installed and configured
 
-cd LLaVA
-pip install -e .
-cd ../EAGLE
-pip install -e .
-cd ../lmms-eval
-pip install -e .
+python -m pip install -e ./LLaVA
+python -m pip install -e ./EAGLE
+python -m pip install -e ./lmms-eval
 ```
-
----
 
 ## 📥 2. Download Datasets
 
@@ -71,24 +72,42 @@ After downloading, organize the data under `./image_data` in the following struc
 
 ## ⚙️ 3. Data Processing
 
-Use the following script to generate training data. You can control the target model by setting the `--model_type` argument (e.g., `llava_v15_t/v` or `qwen2_vl_t/v`):
+Generate hidden-state caches for draft-model training. For LLaVA-1.5 or
+Qwen2.5-VL, use the allocator from the repository root:
 
 ```bash
-cd EAGLE/eagle/ge_data
-
-CUDA_VISIBLE_DEVICES=0 python -m eagle.ge_data.allocation \
-    --outdir <output_data_dir> \
+python -m eagle.ge_data.allocation \
     --model_type <model_type> \
-    --model <base_model_path> \
+    --model <target_model_path> \
     --image_data_path <image_data_dir> \
-    --json_data_path <annotation_file>
+    --json_data_path <annotation_file> \
+    --outdir <output_data_dir> \
+    --gpus 0
 ```
 
----
+Use `llava_v15_v` / `llava_v15_t` for LLaVA-1.5. The existing
+`qwen2_vl_v` / `qwen2_vl_t` identifiers select the Qwen2.5-VL generator.
+`--gpus` accepts multiple GPU indices, and `--start` / `--end` select an
+annotation range with an exclusive end index.
+
+For LLaVA-1.6, use the configurable cache generator:
+
+```bash
+python -m eagle.ge_data.prepare_llava16_hidden_states \
+    --model <target_model_path> \
+    --annotation-path <annotation_file> \
+    --image-root <image_data_dir> \
+    --output-dir <output_data_dir> \
+    --mode teacher
+```
+
+Use `--mode generate` to cache model-generated answers instead. The optional
+`prepare_data_llava16.sh` and `prepare_data_qwen25vl.sh` scripts accept
+`BASE_MODEL`, `IMAGE_DATA`, `JSON_DATA`, and `DATA_OUTPUT` as environment variables.
 
 ## 🏋️ 4. Train the Model
 
-Use DeepSpeed to train the speculative decoding model. Modify the following paths according to your setup:
+Train with DeepSpeed, supplying your own model, cache, and output paths:
 
 ```bash
 cd EAGLE/eagle/train
@@ -97,86 +116,100 @@ deepspeed --master_port 29504 --include localhost:0 main_deepspeed.py \
     --deepspeed_config ds_config.json \
     --tmpdir_v <visual_data_path> \
     --tmpdir_t <text_data_path> \
-    --basepath <base_llm_path> \
+    --basepath <target_model_path> \
     --cpdir <checkpoint_output_dir> \
-    --config <training_config_path>
+    --config <draft_model_config>
 ```
 
-**Parameters:**
-
-* `<visual_data_path>`: directory containing preprocessed visual data
-* `<text_data_path>`: directory containing preprocessed text data
-* `<training_config_path>`: training configuration file, e.g., `llava_v15_7B_config.json`
-
----
-
-## 📊 5. Evaluate the Model
-
-Run evaluation with `lmms-eval`. The following example evaluates on the `ChartQA` task:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=29506 -m lmms_eval \
-    --model <model_name> \
-    --model_args pretrained="<base_model_path>" \
-    --msd_model_path <msd_model_path> \
-    --tasks chartqa \
-    --batch_size 1 \
-    --gen_kwargs temperature=0,max_new_tokens=512 \
-    --limit 100 \
-    --use_msd
-```
-
-**Parameters:**
-
-* `<model_name>`: short name identifier of your model, e.g., `llava_hf_msd` or `qwen2_vl_msd`
-* `<base_model_path>`: path to the base pretrained model
-* `<msd_model_path>`: path to the MSD model
----
-
-## Maintained training and evaluation entrypoints
-
-Use `llava_hf_msd` for Hugging Face LLaVA/LLaVA-NeXT models and
-`qwen2_vl_msd` for Qwen2.5-VL. MSD uses KMeans by default and retains 32
-visual tokens; change the count with `--visual_tokens`. Standard decoding
-is available by omitting `--use_msd`. Generation results retain the original
-prompt prefix. The evaluator reports request-loop time and average accepted
-length directly, without an auxiliary runner.
-
-The LLaVA adapter uses a total sequence limit of 4096. Generation respects
-task defaults and `--gen_kwargs`; specify `max_new_tokens=512` to reproduce
-the previous LLaVA timing configuration. Timing excludes model loading.
-Stop competing GPU workloads before measuring speed.
-
-For offline datasets saved with Hugging Face `save_to_disk`, optionally set
-`MSD_EVAL_DATA_ROOT` to a directory with task subdirectories:
-`chartqa`, `textvqa_val`, `vqav2`, `ai2d`, `scienceqa_img`,
-`hallusion_bench_image`, and `mmbench_en_test`. Otherwise datasets load
-through the normal Hugging Face path.
-
-Run evaluation with the direct `accelerate launch -m lmms_eval` command above.
-Select one or more benchmarks with `--tasks` (comma-separated), and set
-`--limit`, `--gen_kwargs`, and optional `--output_path` explicitly.
-
-`ds_train.sh` accepts `BASE_MODEL`, `VISUAL_DATA`, `TEXT_DATA`,
-`MODEL_CONFIG`, and optional `CKPT_DIR`, `GPU_INCLUDE`, and
-`DEEPSPEED_CONFIG`. For LLaVA-NeXT curriculum training, invoke the trainer
-directly:
+For LLaVA-1.6 curriculum training, run from the repository root:
 
 ```bash
 torchrun --standalone --nproc_per_node=1 \
     EAGLE/eagle/train/main_deepspeed_llava16_decouple_kmeans_repro.py \
-    --basepath <base_model_path> \
-    --tmpdir_v <visual_data_path> --tmpdir_t <text_data_path> \
+    --basepath <target_model_path> \
+    --tmpdir_v <visual_data_path> \
+    --tmpdir_t <text_data_path> \
     --config EAGLE/eagle/train/llava_hf_v16_7B_config.json \
     --deepspeed_config EAGLE/eagle/train/ds_config_llava16_repro.json \
+    --visual_tokens 32 \
     --cpdir <checkpoint_output_dir>
 ```
 
-Data generation uses `prepare_data_llava16.sh` or
-`prepare_data_qwen25vl.sh`, with `BASE_MODEL`, `IMAGE_DATA`, `JSON_DATA`,
-and `DATA_OUTPUT` set explicitly. Source code and configuration belong in
-Git; model weights, datasets, logs, local editor settings, and generated
-figures remain local.
+The curriculum trainer defaults to 30 epochs: 10 text-only epochs, 10 transition
+epochs, then 10 multimodal epochs. Use `--num_epochs`, `--text_epochs`, and
+`--transition_epochs` to change the schedule. Increase `--nproc_per_node` to use
+more local GPUs.
+
+The optional `ds_train.sh` launcher accepts `BASE_MODEL`, `VISUAL_DATA`,
+`TEXT_DATA`, and `MODEL_CONFIG`; use `CKPT_DIR`, `GPU_INCLUDE`, and
+`DEEPSPEED_CONFIG` to override its output, GPU, and DeepSpeed settings.
+
+## 📊 5. Evaluate the Model
+
+Run evaluation directly with `accelerate launch -m lmms_eval`.
+
+### LLaVA-1.6-7B
+
+```bash
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=29506 -m lmms_eval \
+    --model llava_hf_msd \
+    --model_args pretrained=llava-hf/llava-v1.6-vicuna-7b-hf \
+    --msd_model_path lucylyn/MSD-LLaVA1.6-7B \
+    --tasks chartqa \
+    --batch_size 1 \
+    --limit 100 \
+    --gen_kwargs temperature=0,max_new_tokens=512 \
+    --use_msd
+```
+
+For LLaVA-1.5-7B, keep `--model llava_hf_msd` and replace the target model and
+draft checkpoint with `llava-hf/llava-1.5-7b-hf` and
+`lucylyn/MSD-LLaVA1.5-7B`, respectively.
+
+### Qwen2.5-VL-7B
+
+```bash
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=29506 -m lmms_eval \
+    --model qwen2_vl_msd \
+    --model_args pretrained=Qwen/Qwen2.5-VL-7B-Instruct \
+    --msd_model_path lucylyn/MSD-Qwen2.5VL-7B-Instruct \
+    --tasks chartqa \
+    --batch_size 1 \
+    --limit 100 \
+    --gen_kwargs temperature=0,max_new_tokens=512 \
+    --use_msd
+```
+
+### Evaluation settings
+
+- `--use_msd` enables speculative decoding. Omit it for standard decoding.
+- KMeans visual compression is enabled by default for MSD; no
+  `--visual_compression` flag is needed. Use `--visual_tokens` to change the
+  default count of 32. Padding is off by default.
+- Set `max_new_tokens` explicitly when comparing runs: ChartQA's task default
+  is 16, while the examples above use a 512-token limit.
+- Select benchmarks with `--tasks`, optionally comma-separated. Use
+  `--output_path <directory>` to save results.
+- The evaluator reports generation time and average accepted length directly.
+  Timing includes request processing and excludes model loading. Stop competing
+  GPU workloads before measuring speed. Measure standard decoding on the same
+  hardware and samples before calculating a speedup.
+
+The evaluation subsets used in our local runs are:
+
+| Task | `--limit` | Requests |
+|---|---:|---:|
+| `vqav2` | 50 | 100 across validation and test |
+| `ai2d` | 100 | 100 |
+| `scienceqa_img` | 100 | 100 |
+| `chartqa` | 100 | 100 |
+| `textvqa_val` | 50 | 50 |
+| `hallusion_bench_image` | 100 | 100 |
+| `mmbench_en_test` | 100 | 100 |
+
+For offline datasets saved with Hugging Face `save_to_disk`, optionally set
+`MSD_EVAL_DATA_ROOT` to a directory containing subdirectories named after these
+tasks. Otherwise, datasets load through the normal Hugging Face path.
 
 ## Affiliation
 
