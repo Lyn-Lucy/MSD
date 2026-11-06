@@ -131,3 +131,8 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes=1 --main_process_port=2
 * `<base_model_path>`: path to the base pretrained model
 * `<msd_model_path>`: path to the MSD model
 ---
+
+## Affiliation
+
+1. Shanghai Innovation Institute
+2. Xiamen University
